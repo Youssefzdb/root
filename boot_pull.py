@@ -14,6 +14,7 @@ import json
 import zipfile
 import shutil
 import struct
+import re
 import hashlib
 import urllib.request
 import urllib.error
