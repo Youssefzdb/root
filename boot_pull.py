@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================
-#  Shadow Core Boot Puller v12
+#  Shadow Core Boot Puller v13
 #  Device: OPPO Reno 5 CPH2159 | Helio P95
 #
 #  Method Chain (Auto Fallback):
@@ -18,27 +18,30 @@ C="\033[36m"; W="\033[97m"; B="\033[90m"; RESET="\033[0m"
 
 BANNER = f"""
 {R}╔══════════════════════════════════════════════╗
-║  {W}Shadow Core Boot Puller  v12{R}              ║
+║  {W}Shadow Core Boot Puller  v13{R}              ║
 ║  {B}OPPO Reno 5 CPH2159 | Helio P95{R}          ║
 ║  {B}3-Method Chain | Auto Fallback{R}            ║
 ╚══════════════════════════════════════════════╝{RESET}
 """
 
-OUTPUT_DIR  = os.path.expanduser("~/boot_images")
-TOOLS_DIR   = os.path.expanduser("~/boot_images/tools")
-STORAGE_DIR = os.path.expanduser("/sdcard/Download")
+TERMUX_HOME = os.path.expanduser("~")
+OUTPUT_DIR  = os.path.join(TERMUX_HOME, "boot_images")
+TOOLS_DIR   = os.path.join(TERMUX_HOME, "boot_images", "tools")
 
-DSU_APK_URL = "https://github.com/VegaBobo/DSU-Sideloader/releases/download/2.03/app-release.apk"
-DSU_MOD_URL = "https://github.com/VegaBobo/DSU-Sideloader/releases/download/2.03/module_DSU_Sideloader.zip"
+# مسارات sdcard المحتملة
+SDCARD_CANDIDATES = [
+    "/sdcard/Download",
+    "/storage/emulated/0/Download",
+    os.path.join(TERMUX_HOME, "storage/downloads"),
+    os.path.join(TERMUX_HOME, "storage/shared/Download"),
+]
+
+DSU_APK_URL  = "https://github.com/VegaBobo/DSU-Sideloader/releases/download/2.03/app-release.apk"
 DSU_APK_NAME = "DSU-Sideloader-2.03.apk"
-DSU_MOD_NAME = "DSU-Sideloader-module.zip"
 
-# أفضل GSI لـ CPH2159: arm64 + A/B + vanilla (أصغر) + بدون secure (له su)
-# system-squeak-arm64-ab-vanilla = 578MB ← لا يحتوي su!
-# نحتاج floss (= free software = له su بداخله)
-GSI_URL  = "https://github.com/phhusson/treble_experimentations/releases/download/v416/system-squeak-arm64-ab-floss.img.xz"
-GSI_NAME = "phh-gsi-arm64-ab-floss-v416.img.xz"
-GSI_SIZE_MB = 842
+GSI_URL      = "https://github.com/phhusson/treble_experimentations/releases/download/v416/system-squeak-arm64-ab-floss.img.xz"
+GSI_NAME     = "phh-gsi-arm64-ab-floss-v416.img.xz"
+GSI_SIZE_MB  = 842
 
 def success(m): print(f"{G}[✓] {m}{RESET}")
 def error(m):   print(f"{R}[✗] {m}{RESET}")
@@ -59,8 +62,47 @@ def run(cmd, timeout=15):
 
 def exists_bin(b): return shutil.which(b) is not None
 
+# ─── sdcard resolver ────────────────────────────
+def get_sdcard_download():
+    """يجد مسار Download المتاح للكتابة"""
+    for path in SDCARD_CANDIDATES:
+        if os.path.isdir(path):
+            # اختبر الكتابة
+            test = os.path.join(path, ".sc_test")
+            try:
+                with open(test, 'w') as f: f.write("1")
+                os.remove(test)
+                return path
+            except:
+                continue
+    return None
+
+def setup_termux_storage():
+    """يطلب إذن storage من Termux"""
+    sdcard = get_sdcard_download()
+    if sdcard:
+        return sdcard
+
+    info("إذن storage غير ممنوح — طلب الإذن...")
+    print(f"\n{Y}سيظهر لك dialog لمنح إذن الوصول للـ storage.{RESET}")
+    print(f"{W}اضغط Allow عندما يظهر. انتظر 5 ثوان...{RESET}\n")
+
+    run("termux-setup-storage", timeout=30)
+    time.sleep(5)
+
+    # انتظر حتى يظهر الـ storage
+    for _ in range(6):
+        sdcard = get_sdcard_download()
+        if sdcard:
+            success(f"Storage متاح: {sdcard}")
+            return sdcard
+        time.sleep(2)
+
+    warn("storage غير متاح بعد الإذن — سنحفظ في Termux home فقط")
+    return None
+
+# ─── Download with progress ─────────────────────
 def download_file(url, dest, label=""):
-    """تحميل ملف مع progress bar"""
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     info(f"تحميل {label or os.path.basename(dest)}...")
     try:
@@ -77,18 +119,38 @@ def download_file(url, dest, label=""):
                     if total:
                         pct = done / total * 100
                         bar = "█" * int(pct/5) + "░" * (20 - int(pct/5))
-                        print(f"\r  {C}[{bar}] {pct:.0f}% — {done//1024//1024}/{total//1024//1024} MB{RESET}",
+                        print(f"\r  {C}[{bar}] {pct:.0f}%  {done//1024//1024}/{total//1024//1024} MB{RESET}",
                               end="", flush=True)
         print()
-        size = os.path.getsize(dest)
-        success(f"تم: {size//1024//1024} MB → {dest}")
+        success(f"تم: {os.path.getsize(dest)//1024//1024} MB → {dest}")
         return True
     except Exception as e:
         print()
         error(f"فشل التحميل: {e}")
         return False
 
-# ─── Shared Utils ──────────────────────────────────
+def copy_to_sdcard(src, sdcard_dir, name):
+    """ينسخ ملف للـ sdcard مع معالجة الأخطاء"""
+    if not sdcard_dir or not os.path.exists(src):
+        return None
+    dest = os.path.join(sdcard_dir, name)
+    try:
+        shutil.copy2(src, dest)
+        success(f"نُسخ إلى: {dest}")
+        return dest
+    except PermissionError:
+        # جرب cp بدلاً من shutil
+        _, err, rc = run(f"cp '{src}' '{dest}'")
+        if rc == 0:
+            success(f"نُسخ (cp) إلى: {dest}")
+            return dest
+        warn(f"لا يمكن النسخ إلى sdcard: {err}")
+        return None
+    except Exception as e:
+        warn(f"نسخ فشل: {e}")
+        return None
+
+# ─── Boot utils ─────────────────────────────────
 def find_boot_partition(use_su=False):
     pfx = "su -c " if use_su else ""
     for path in [
@@ -101,7 +163,6 @@ def find_boot_partition(use_su=False):
         if rc == 0 and out.startswith("/dev/"):
             return out
 
-    # bash find (XDA method)
     cmd = (r'for P in boot boot_a boot_b; do '
            r'B=$(find /dev/block \( -type b -o -type c -o -type l \) '
            r'-iname "$P" -print -quit 2>/dev/null); '
@@ -113,7 +174,6 @@ def find_boot_partition(use_su=False):
             if path.strip().startswith('/dev/'):
                 return path.strip()
 
-    # ls -la by-name fallback
     out, _, _ = run(f"{pfx}ls -la /dev/block/by-name/ 2>/dev/null")
     for line in out.split("\n"):
         if re.search(r'\bboot\b', line, re.I) and '->' in line:
@@ -127,39 +187,28 @@ def dd_extract(partition, outfile, use_su=False):
     cmd = f"{pfx}dd if={partition} of={outfile} bs=4096"
     info(f"تشغيل: {cmd}")
     _, _, _ = run(cmd, timeout=180)
-    if os.path.exists(outfile) and os.path.getsize(outfile) > 512*1024:
-        return True
-    # جرب حفظ في /sdcard أيضاً
-    sdcard_out = os.path.join(STORAGE_DIR, os.path.basename(outfile))
-    cmd2 = f"{pfx}dd if={partition} of={sdcard_out} bs=4096"
-    _, _, _ = run(cmd2, timeout=180)
-    if os.path.exists(sdcard_out) and os.path.getsize(sdcard_out) > 512*1024:
-        shutil.copy2(sdcard_out, outfile)
-        return True
-    return False
+    return os.path.exists(outfile) and os.path.getsize(outfile) > 512*1024
 
 def verify(f):
     try:
-        with open(f, 'rb') as fp:
-            magic = fp.read(8)
+        with open(f, 'rb') as fp: magic = fp.read(8)
         if magic[:8] == b'ANDROID!':
             success(f"boot.img صحيح ✅  Magic: ANDROID! — {os.path.getsize(f)//1024//1024} MB")
-            return True
-        warn(f"Magic: {magic.hex()} — تحقق يدوياً")
-        return True
-    except: return False
+        else:
+            warn(f"Magic: {magic.hex()} — تحقق يدوياً")
+    except: pass
 
 
 # ══════════════════════════════════════════════════
-#  METHOD 1 — Root / KernelSU / su
+#  METHOD 1 — Root / KernelSU
 # ══════════════════════════════════════════════════
 def method1_root(outfile):
     banner2("الطريقة 1: Root / KernelSU → dd partition")
 
     uid_out, _, _ = run("id")
     is_root = "uid=0" in uid_out
-    su_out, _, _ = run("su -c id", timeout=8)
-    has_su = "uid=0" in su_out
+    su_out, _, _  = run("su -c id", timeout=8)
+    has_su  = "uid=0" in su_out
 
     if not is_root and not has_su:
         warn("لا root ولا su → الانتقال للطريقة 2")
@@ -168,11 +217,9 @@ def method1_root(outfile):
     use_su = not is_root
     success(f"{'su متاح' if use_su else 'root مباشر'}!")
 
-    # active slot
     slot, _, _ = run("getprop ro.boot.slot_suffix")
-    info(f"Active slot: {slot or 'A-only'}")
+    partition  = find_boot_partition(use_su=use_su)
 
-    partition = find_boot_partition(use_su=use_su)
     if not partition and slot:
         pfx = "su -c " if use_su else ""
         out, _, _ = run(f"{pfx}readlink -f /dev/block/by-name/boot{slot} 2>/dev/null")
@@ -183,36 +230,22 @@ def method1_root(outfile):
         return False
 
     success(f"Boot partition: {partition}")
-    if dd_extract(partition, outfile, use_su=use_su):
-        return True
-    warn("dd فشل")
-    return False
+    return dd_extract(partition, outfile, use_su=use_su)
 
 
 # ══════════════════════════════════════════════════
-#  METHOD 2 — DSU Sideloader + PHH GSI → su → dd
+#  METHOD 2 — DSU Sideloader + PHH GSI
 # ══════════════════════════════════════════════════
 def method2_dsu(outfile):
     banner2("الطريقة 2: DSU Sideloader + PHH GSI → su → dd")
 
     os.makedirs(TOOLS_DIR, exist_ok=True)
 
-    # ─── فحص Treble ───
-    info("فحص Project Treble...")
-    treble, _, _  = run("getprop ro.treble.enabled")
-    ab_update, _, _ = run("getprop ro.build.ab_update")
-    slot, _, _    = run("getprop ro.boot.slot_suffix")
-    sdk, _, _     = run("getprop ro.build.version.sdk")
-    brand, _, _   = run("getprop ro.product.system.brand")
-
-    info(f"Treble={treble} | A/B={ab_update} | slot={slot} | SDK={sdk} | brand={brand}")
-
-    # ─── هل نحن الآن داخل PHH GSI؟ ───
+    # ─── هل نحن داخل GSI؟ ───
     flavor, _, _ = run("getprop ro.system.build.flavor")
-    phh_app, _, _ = run("pm list packages 2>/dev/null | grep me.phh.superuser")
-
-    if "phh" in flavor.lower() or "treble" in flavor.lower() or phh_app:
-        success("✅ أنت داخل PHH GSI!")
+    phh_pkg, _, _ = run("pm list packages 2>/dev/null | grep me.phh.superuser")
+    if "phh" in flavor.lower() or "treble" in flavor.lower() or phh_pkg:
+        success("✅ أنت داخل PHH GSI الآن!")
         su_test, _, _ = run("su -c id", timeout=8)
         if "uid=0" in su_test:
             success("su يعمل! جاري الاستخراج...")
@@ -220,133 +253,172 @@ def method2_dsu(outfile):
             if partition:
                 success(f"Boot partition: {partition}")
                 return dd_extract(partition, outfile, use_su=True)
-            else:
-                error("لم يُعثر على boot partition حتى داخل GSI")
-                return False
         else:
-            warn("su غير متاح داخل GSI — تحقق من PHH Superuser app")
-            return False
-
-    # ─── لم نكن في GSI بعد → نُحضّر الملفات ───
-    if treble != "true":
-        warn("جهازك لا يدعم Project Treble — DSU لن يعمل")
+            warn("افتح PHH Superuser app وامنح إذن su لـ Termux، ثم أعد تشغيل الأداة")
         return False
 
-    success(f"Treble مدعوم! SDK={sdk}")
+    # ─── فحص Treble ───
+    treble, _, _ = run("getprop ro.treble.enabled")
+    sdk, _, _    = run("getprop ro.build.version.sdk")
 
-    # ─── تحميل DSU Sideloader APK ───
-    apk_path = os.path.join(TOOLS_DIR, DSU_APK_NAME)
-    apk_sdcard = os.path.join(STORAGE_DIR, DSU_APK_NAME)
+    if treble != "true":
+        warn("جهازك لا يدعم Treble → الانتقال للطريقة 3")
+        return False
 
-    if not os.path.exists(apk_path) and not os.path.exists(apk_sdcard):
-        info("تحميل DSU Sideloader APK...")
-        if not download_file(DSU_APK_URL, apk_path, "DSU Sideloader v2.03 APK"):
+    success(f"Treble=true | SDK={sdk}")
+
+    # ─── حل مشكلة storage ───
+    info("فحص صلاحيات storage...")
+    sdcard = get_sdcard_download()
+    if not sdcard:
+        info("طلب إذن storage من Termux...")
+        sdcard = setup_termux_storage()
+
+    if sdcard:
+        success(f"storage متاح: {sdcard}")
+    else:
+        warn(f"storage غير متاح — سيُحفظ APK في: {TOOLS_DIR}")
+        info("يمكنك تشغيل: termux-setup-storage  ثم إعادة تشغيل الأداة")
+
+    # ─── DSU APK ───
+    apk_local   = os.path.join(TOOLS_DIR, DSU_APK_NAME)
+    apk_sdcard  = os.path.join(sdcard, DSU_APK_NAME) if sdcard else None
+
+    # ابحث هل موجود مسبقاً
+    apk_exists = None
+    for p in filter(None, [apk_sdcard, apk_local]):
+        if os.path.exists(p) and os.path.getsize(p) > 1024*1024:
+            apk_exists = p
+            success(f"DSU APK موجود: {p}")
+            break
+
+    if not apk_exists:
+        if download_file(DSU_APK_URL, apk_local, "DSU Sideloader v2.03 APK (~5 MB)"):
+            apk_exists = apk_local
+            # انسخ للـ sdcard
+            if sdcard:
+                copied = copy_to_sdcard(apk_local, sdcard, DSU_APK_NAME)
+                if copied:
+                    apk_exists = copied  # اجعل المرجع الرئيسي هو sdcard
+        else:
             warn("فشل تحميل DSU APK")
-    else:
-        success(f"DSU APK موجود مسبقاً")
-        apk_path = apk_path if os.path.exists(apk_path) else apk_sdcard
 
-    # انسخ APK للـ sdcard
-    sdcard_apk = os.path.join(STORAGE_DIR, DSU_APK_NAME)
-    if os.path.exists(apk_path) and not os.path.exists(sdcard_apk):
-        try:
-            shutil.copy2(apk_path, sdcard_apk)
-            success(f"APK في: {sdcard_apk}")
-        except Exception as e:
-            warn(f"نسخ APK: {e}")
+    # ─── تثبيت APK تلقائياً ───
+    if apk_exists:
+        info("تثبيت DSU Sideloader APK...")
+        out, err, rc = run(f"pm install -r \"{apk_exists}\"", timeout=45)
+        combined = (out + " " + err).lower()
+        if "success" in combined:
+            success("DSU Sideloader مُثبَّت تلقائياً! ✅")
+        elif "already" in combined or "downgrade" in combined:
+            success("DSU Sideloader مُثبَّت مسبقاً ✅")
+        else:
+            warn(f"pm install: {(out or err)[:80]}")
+            info(f"ثبّته يدوياً: افتح مدير الملفات → {apk_exists}")
 
-    # ─── تحميل PHH GSI ───
-    gsi_path    = os.path.join(TOOLS_DIR, GSI_NAME)
-    gsi_sdcard  = os.path.join(STORAGE_DIR, GSI_NAME)
+    # ─── PHH GSI ───
+    gsi_local   = os.path.join(TOOLS_DIR, GSI_NAME)
+    gsi_sdcard  = os.path.join(sdcard, GSI_NAME) if sdcard else None
 
-    if os.path.exists(gsi_path):
-        success(f"PHH GSI موجود: {gsi_path}")
-    elif os.path.exists(gsi_sdcard):
-        success(f"PHH GSI موجود: {gsi_sdcard}")
-        gsi_path = gsi_sdcard
-    else:
-        print(f"\n{Y}PHH GSI حجمه {GSI_SIZE_MB} MB.{RESET}")
-        print(f"{W}هل تريد تحميله الآن؟ (y/n) [n=تخطي وأرى التعليمات]: {RESET}", end="", flush=True)
+    gsi_exists = None
+    for p in filter(None, [gsi_sdcard, gsi_local]):
+        if os.path.exists(p) and os.path.getsize(p) > 100*1024*1024:
+            gsi_exists = p
+            success(f"PHH GSI موجود: {p}")
+            break
+
+    if not gsi_exists:
+        # حساب المساحة المتاحة
+        stat = shutil.disk_usage(TERMUX_HOME)
+        free_gb = stat.free / 1024**3
+        info(f"مساحة متاحة في Termux home: {free_gb:.1f} GB")
+        if sdcard:
+            try:
+                stat_sd = shutil.disk_usage(sdcard)
+                free_sd = stat_sd.free / 1024**3
+                info(f"مساحة متاحة في sdcard: {free_sd:.1f} GB")
+            except: free_sd = 0
+        else:
+            free_sd = 0
+
+        print(f"\n{Y}PHH GSI حجمه ~{GSI_SIZE_MB} MB.{RESET}")
+        print(f"{W}هل تريد تحميله الآن؟ (y/n): {RESET}", end="", flush=True)
         try:
             choice = input().strip().lower()
         except (KeyboardInterrupt, EOFError):
             choice = 'n'
 
         if choice == 'y':
-            # حاول الحفظ في sdcard أولاً (مساحة أكبر)
-            save_to = gsi_sdcard if os.path.exists(STORAGE_DIR) else gsi_path
-            if not download_file(GSI_URL, save_to, f"PHH GSI v416 arm64-ab-floss ({GSI_SIZE_MB} MB)"):
-                warn("فشل تحميل GSI")
+            # اختر أفضل مكان للحفظ
+            if sdcard and free_sd > 1.0:
+                save_to = os.path.join(sdcard, GSI_NAME)
+            elif free_gb > 1.0:
+                save_to = gsi_local
             else:
-                gsi_path = save_to
+                error(f"لا توجد مساحة كافية (متاح: {free_gb:.1f} GB في Termux, {free_sd:.1f} GB في sdcard)")
+                save_to = None
 
-    # ─── تعليمات التثبيت ───
+            if save_to and download_file(GSI_URL, save_to, f"PHH GSI v416 ({GSI_SIZE_MB} MB)"):
+                gsi_exists = save_to
+                # انسخ للـ sdcard إذا لزم
+                if save_to == gsi_local and sdcard:
+                    copy_to_sdcard(gsi_local, sdcard, GSI_NAME)
+
+    # ─── ملخص التعليمات ───
     print(f"""
 {C}{'═'*54}
-  خطوات تثبيت DSU + PHH GSI
+  خطوات DSU + PHH GSI
 {'═'*54}{RESET}
 
-{W}الملفات المُحمّلة:{RESET}""")
+{W}الملفات:{RESET}""")
 
-    if os.path.exists(sdcard_apk):
-        print(f"  {G}✓ DSU Sideloader APK:{RESET} {B}{sdcard_apk}{RESET}")
-    else:
-        print(f"  {Y}⚠ DSU APK لم يُحمَّل — نزّله من:{RESET}")
-        print(f"    {B}{DSU_APK_URL}{RESET}")
+    dsu_display = apk_exists or f"{Y}لم يُحمَّل ← شغّل الأداة مرة أخرى{RESET}"
+    gsi_display = gsi_exists or f"{Y}لم يُحمَّل ← أجب بـ y عند السؤال{RESET}"
 
-    if os.path.exists(gsi_path):
-        print(f"  {G}✓ PHH GSI:{RESET} {B}{gsi_path}{RESET}")
-    else:
-        print(f"  {Y}⚠ PHH GSI لم يُحمَّل — نزّله من:{RESET}")
-        print(f"    {B}{GSI_URL}{RESET}")
-
-    # تثبيت APK تلقائياً
-    if os.path.exists(sdcard_apk):
-        info("محاولة تثبيت DSU APK تلقائياً...")
-        out, err, rc = run(f"pm install -r {sdcard_apk}", timeout=30)
-        if rc == 0 or "success" in out.lower():
-            success("DSU Sideloader مُثبَّت! ✅")
-        else:
-            info(f"pm install: {out or err}")
+    print(f"  DSU APK : {G if apk_exists else Y}{apk_exists or 'غير موجود'}{RESET}")
+    print(f"  PHH GSI : {G if gsi_exists else Y}{gsi_exists or 'غير موجود'}{RESET}")
 
     print(f"""
-{W}الخطوات اليدوية (مرة واحدة فقط):{RESET}
+{W}الخطوات:{RESET}
 
-{W}1. ثبّت DSU Sideloader APK:{RESET}
-   {B}• افتح مدير الملفات → {sdcard_apk if os.path.exists(sdcard_apk) else 'Download/'+DSU_APK_NAME}{RESET}
-   {B}• اضغط على الملف وثبّته (قد تحتاج تفعيل "مصادر غير معروفة"){RESET}
+{W}1.{RESET} ثبّت DSU Sideloader:""")
+    if apk_exists:
+        print(f"   {G}APK مُثبَّت تلقائياً ✅ — أو افتح الملف يدوياً:{RESET}")
+        print(f"   {B}{apk_exists}{RESET}")
+    else:
+        print(f"   {B}{DSU_APK_URL}{RESET}")
 
-{W}2. افتح DSU Sideloader وحدد الـ GSI:{RESET}
-   {B}• اختر الملف: {gsi_path if os.path.exists(gsi_path) else 'PHH GSI .img.xz'}{RESET}
-   {B}• اضغط Install (سيأخذ وقتاً){RESET}
-   {B}• الجهاز سيُعيد التشغيل في GSI مؤقتاً{RESET}
+    print(f"""
+{W}2.{RESET} افتح DSU Sideloader → اختر الـ GSI:""")
+    if gsi_exists:
+        print(f"   {B}{gsi_exists}{RESET}")
+    else:
+        print(f"   {B}{GSI_URL}{RESET}")
 
-{W}3. بعد الإقلاع في GSI — شغّل هذه الأداة مجدداً:{RESET}
-   {B}cd ~/root-cli && git pull && python boot_pull.py{RESET}
-   {G}← الطريقة 1 ستنجح تلقائياً بـ su من PHH{RESET}
+    print(f"""   اضغط Install — الجهاز يُقلع في GSI مؤقتاً
 
-{Y}ملاحظة: GSI مؤقت 100% — الجهاز يعود لـ ColorOS عند الإقلاع العادي{RESET}
+{W}3.{RESET} بعد الإقلاع في GSI، شغّل:
+   {G}cd ~/root-cli && git pull && python boot_pull.py{RESET}
+   {B}← الطريقة 1 ستنجح تلقائياً بـ su{RESET}
+
+{Y}GSI مؤقت 100% — ColorOS يعود عند الإقلاع العادي{RESET}
 """)
 
-    return False  # لن ننجح الآن، لكن الملفات جاهزة
+    return False
 
 
 # ══════════════════════════════════════════════════
-#  METHOD 3 — MTK DA Bypass (PC required)
+#  METHOD 3 — MTK DA Bypass
 # ══════════════════════════════════════════════════
 def method3_mtk(outfile):
     banner2("الطريقة 3: MTK DA Bypass — Helio P95 (MT6779)")
 
-    # فحص هل mtkclient متاح محلياً (لو شغّلها من PC)
     if exists_bin("mtk") or exists_bin("mtkclient"):
         success("mtkclient موجود!")
-        # فحص USB device
         tty_devs = [d for d in ["/dev/ttyUSB0","/dev/ttyUSB1","/dev/ttyACM0"] if os.path.exists(d)]
         if tty_devs:
             success(f"USB serial: {tty_devs[0]}")
-            info("جاري محاولة dump boot...")
             out, err, rc = run(f"mtk r boot {outfile}", timeout=120)
-            info(f"mtkclient: {(out+err)[:150]}")
             if os.path.exists(outfile) and os.path.getsize(outfile) > 512*1024:
                 return True
 
@@ -369,7 +441,7 @@ def method3_mtk(outfile):
 {W}انقل boot.img للجهاز:{RESET}
   {B}adb push boot.img /sdcard/Download/{RESET}
 
-{G}✓ MT6779 / Helio P95 = مدعوم في mtkclient{RESET}
+{G}✓ MT6779 / Helio P95 = مدعوم{RESET}
 {B}https://github.com/bkerler/mtkclient{RESET}
 """)
     return False
@@ -384,12 +456,10 @@ def main():
     os.makedirs(TOOLS_DIR, exist_ok=True)
 
     step(0, "معلومات الجهاز")
-    props = {}
     for prop in ["ro.product.name", "ro.build.version.ota", "ro.boot.slot_suffix",
-                 "ro.treble.enabled", "ro.boot.flash.locked", "ro.build.ab_update",
-                 "ro.build.version.sdk"]:
+                 "ro.treble.enabled", "ro.boot.flash.locked",
+                 "ro.build.ab_update", "ro.build.version.sdk"]:
         val, _, _ = run(f"getprop {prop}")
-        props[prop] = val
         info(f"  {prop.split('.')[-1]}: {val}")
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -421,8 +491,9 @@ def main():
 {'═'*52}{RESET}
 {W}1. ثبّت Magisk:{RESET}
    {B}https://github.com/topjohnwu/Magisk/releases{RESET}
-{W}2. Magisk → Install → Patch a File → اختر boot.img{RESET}
-{W}3. فلّش:{RESET}
+{W}2. Magisk → Install → Patch a File → اختر:{RESET}
+   {B}{outfile}{RESET}
+{W}3. فلّش الناتج:{RESET}
    {B}fastboot flash boot magisk_patched.img{RESET}
 {C}{'═'*52}{RESET}
 """)
@@ -434,7 +505,7 @@ def main():
             time.sleep(0.3)
 
     print(f"\n{R}[✗] لم تنجح الطرق الثلاث تلقائياً.{RESET}")
-    print(f"{W}اتبع تعليمات الطريقة 2 (DSU) الموضحة أعلاه — الخطوات بسيطة{RESET}\n")
+    print(f"{W}اتبع خطوات الطريقة 2 (DSU) أعلاه — APK جاهز ✓{RESET}\n")
 
 
 if __name__ == "__main__":
