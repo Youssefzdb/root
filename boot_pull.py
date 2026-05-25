@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # ============================================
-#  Shadow Core Boot Puller v7
+#  Shadow Core Boot Puller v8
 #  Device: OPPO Reno 5 CPH2159 | ColorOS
 #  Platform: Termux — No Root, No PC
-#  Crypto: Exact match of realme-ota source
 # ============================================
 
 import subprocess, sys, os, json, zipfile, shutil
@@ -17,7 +16,7 @@ C="\033[36m"; W="\033[97m"; B="\033[90m"; RESET="\033[0m"
 
 BANNER = f"""
 {R}╔══════════════════════════════════════════════╗
-║  {W}Shadow Core Boot Puller  v7{R}               ║
+║  {W}Shadow Core Boot Puller  v8{R}               ║
 ║  {B}OPPO Reno 5 CPH2159 | No Root | No PC{R}    ║
 ╚══════════════════════════════════════════════╝{RESET}
 """
@@ -31,264 +30,218 @@ def warn(m):    print(f"{Y}[!] {m}{RESET}")
 def info(m):    print(f"{C}[*] {m}{RESET}")
 def step(n, m): print(f"\n{W}━━[{n}] {m}━━{RESET}")
 
-# ─── Crypto (exact copy from realme-ota/utils/crypto.py) ──────────
+# ─── Crypto (exact from realme-ota/utils/crypto.py) ───
 KEYS = ["oppo1997","baed2017","java7865","231uiedn","09e32ji6",
         "0oiu3jdy","0pej387l","2dkliuyt","20odiuye","87j3id7w"]
 
 def ensure_pycrypto():
     try:
-        from Crypto.Cipher import AES
-        return True
+        from Crypto.Cipher import AES; return True
     except ImportError:
         info("تثبيت pycryptodome...")
         subprocess.run([sys.executable,"-m","pip","install","--quiet","pycryptodome"],
                        timeout=90, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
-            from Crypto.Cipher import AES
-            success("pycryptodome جاهز")
-            return True
-        except:
-            return False
+            from Crypto.Cipher import AES; success("pycryptodome جاهز"); return True
+        except: return False
 
 def get_key(key_pseudo):
     return (KEYS[int(key_pseudo[0])] + key_pseudo[4:12]).encode('utf-8')
 
-def enc_aes_ecb(data_bytes, key_bytes):
+def enc_ecb(data_bytes, key_bytes):
     from Crypto.Cipher import AES
     from Crypto.Util.Padding import pad
-    cipher = AES.new(key_bytes, AES.MODE_ECB)
-    return cipher.encrypt(pad(data_bytes, AES.block_size))
+    return AES.new(key_bytes, AES.MODE_ECB).encrypt(pad(data_bytes, 16))
 
-def dec_aes_ecb(data_bytes, key_bytes):
+def dec_ecb(data_bytes, key_bytes):
     from Crypto.Cipher import AES
     from Crypto.Util.Padding import unpad
-    cipher = AES.new(key_bytes, AES.MODE_ECB)
-    return unpad(cipher.decrypt(data_bytes), AES.block_size)
+    return unpad(AES.new(key_bytes, AES.MODE_ECB).decrypt(data_bytes), 16)
 
-def enc_aes_ctr(data_bytes, key_bytes, iv_bytes):
+def enc_ctr(data_bytes, key_bytes, iv_bytes):
     from Crypto.Cipher import AES
     from Crypto.Util import Counter
     ctr = Counter.new(128, initial_value=int.from_bytes(iv_bytes, 'big'))
-    cipher = AES.new(key_bytes, AES.MODE_CTR, counter=ctr)
-    return cipher.encrypt(data_bytes)
+    return AES.new(key_bytes, AES.MODE_CTR, counter=ctr).encrypt(data_bytes)
 
-def dec_aes_ctr(data_bytes, key_bytes, iv_bytes):
+def dec_ctr(data_bytes, key_bytes, iv_bytes):
     from Crypto.Cipher import AES
     from Crypto.Util import Counter
     ctr = Counter.new(128, initial_value=int.from_bytes(iv_bytes, 'big'))
-    cipher = AES.new(key_bytes, AES.MODE_CTR, counter=ctr)
-    return cipher.decrypt(data_bytes)
+    return AES.new(key_bytes, AES.MODE_CTR, counter=ctr).decrypt(data_bytes)
 
-# RUI v1: ECB with derived key
 def encrypt_ecb(buf):
-    key_pseudo = str(randint(0,9)) + ''.join(choices(string.ascii_letters+string.digits, k=14))
-    key_real = get_key(key_pseudo)
-    encrypted = enc_aes_ecb(buf.encode('utf-8'), key_real)
-    return base64.b64encode(encrypted).decode('utf-8') + key_pseudo
+    kp = str(randint(0,9)) + ''.join(choices(string.ascii_letters+string.digits, k=14))
+    kr = get_key(kp)
+    return base64.b64encode(enc_ecb(buf.encode('utf-8'), kr)).decode() + kp
 
 def decrypt_ecb(buf):
     data = base64.b64decode(buf[:-15])
     key  = get_key(buf[-15:])
-    return dec_aes_ecb(data, key).decode('utf-8')
+    return dec_ecb(data, key).decode('utf-8')
 
-# RUI v2+: CTR with derived key
 def encrypt_ctr(buf):
-    key_pseudo = str(randint(0,9)) + ''.join(choices(string.digits, k=14))
-    key_real = get_key(key_pseudo)
-    iv = hashlib.md5(key_real).digest()
-    encrypted = enc_aes_ctr(buf.encode('utf-8'), key_real, iv)
-    return base64.b64encode(encrypted).decode('utf-8') + key_pseudo
+    kp = str(randint(0,9)) + ''.join(choices(string.digits, k=14))
+    kr = get_key(kp)
+    iv = hashlib.md5(kr).digest()
+    return base64.b64encode(enc_ctr(buf.encode('utf-8'), kr, iv)).decode() + kp
 
 def decrypt_ctr(buf):
     data = base64.b64decode(buf[:-15])
     key  = get_key(buf[-15:])
     iv   = hashlib.md5(key).digest()
-    return dec_aes_ctr(data, key, iv).decode('utf-8')
+    return dec_ctr(data, key, iv).decode('utf-8')
 
-def sha256_upper(s):
-    return hashlib.sha256(s.encode('utf-8')).hexdigest().upper()
+def sha256u(s):
+    return hashlib.sha256(s.encode()).hexdigest().upper()
 
-# ─── Endpoints ────────────────────────────────────────
-# RUI 1 → ECB → /post/Query_Update
-# RUI 2+ → CTR → /update/v3
-URLS = {
-    'v1_gl': 'https://ifota.realmemobile.com/post/Query_Update',
-    'v1_oppo': 'https://iota.coloros.com/post/Query_Update',
-    'v1_eu': 'https://ifota-eu.realmemobile.com/post/Query_Update',
-    'v1_in': 'https://ifota-in.realmemobile.com/post/Query_Update',
-    'v2_gl': 'https://component-ota-f.coloros.com/update/v3',
-    'v2_sg': 'https://component-otapc-sg.allawnos.com/update/v3',
-}
-
-# ─── Build body (matches default_body in data.py exactly) ─────────
+# ─── Build request ─────────────────────────────────────
 def build_body(device):
     ota = device['ota_version']
     parts = ota.split('_')
     prefix = '_'.join(parts[:2]) if len(parts) >= 2 else ota
     rui = device['rui_version']
     nv  = device['nv_id']
-    nv_carrier = nv if nv != '0' else ('10010111' if False else '00011011')
-
+    nvc = nv if (nv and nv != '0') else '00011011'
     return {
-        "language":       "en-EN",
-        "romVersion":     ota,
-        "otaVersion":     ota,
-        "androidVersion": f"Android{10 + rui - 1}.0",
+        "language": "en-EN", "romVersion": ota, "otaVersion": ota,
+        "androidVersion": f"Android{10+rui-1}.0",
         "colorOSVersion": f"ColorOS{rui}",
-        "model":          device['product_name'],
-        "productName":    device['product_name'],
-        "operator":       device['product_name'],
-        "uRegion":        "GL",
-        "trackRegion":    "GL",
-        "imei":           "000000000000000",
-        "imei1":          "000000000000000",
-        "mode":           "0",
-        "registrationId": "unknown",
-        "deviceId":       sha256_upper("000000000000000"),
-        "version":        "3",
-        "type":           "1",
-        "otaPrefix":      prefix,
-        "romPrefix":      prefix,
-        "isRealme":       "0",
-        "time":           str(int(_time.time() * 1000)),
-        "canCheckSelf":   "0",
-        "nvId":           nv,
-        "nvCarrier":      nv_carrier,
-        "partCarrier":    nv_carrier,
-        "localCarrier":   nv_carrier,
+        "model": device['product_name'], "productName": device['product_name'],
+        "operator": device['product_name'],
+        "uRegion": "GL", "trackRegion": "GL",
+        "imei": "000000000000000", "imei1": "000000000000000",
+        "mode": "0", "registrationId": "unknown",
+        "deviceId": sha256u("000000000000000"),
+        "version": "3", "type": "1",
+        "otaPrefix": prefix, "romPrefix": prefix, "isRealme": "0",
+        "time": str(int(_time.time()*1000)), "canCheckSelf": "0",
+        "nvId": nv, "nvCarrier": nvc, "partCarrier": nvc, "localCarrier": nvc,
     }
 
 def build_headers(device):
-    ota = device['ota_version']
-    rui = device['rui_version']
+    ota = device['ota_version']; rui = device['rui_version']
     nv  = device['nv_id']
+    nvc = nv if (nv and nv != '0') else '00011011'
     return {
-        'language':       'en-EN',
-        'romVersion':     ota,
-        'otaVersion':     ota,
-        'androidVersion': f"Android{10 + rui - 1}.0",
+        'language': 'en-EN', 'romVersion': ota, 'otaVersion': ota,
+        'androidVersion': f"Android{10+rui-1}.0",
         'colorOSVersion': f"ColorOS{rui}",
-        'model':          device['product_name'],
-        'infVersion':     '1',
-        'operator':       device['product_name'],
-        'nvCarrier':      nv if nv != '0' else '00011011',
-        'uRegion':        'GL',
-        'trackRegion':    'GL',
-        'imei':           '000000000000000',
-        'imei1':          '000000000000000',
-        'deviceId':       sha256_upper("000000000000000"),
-        'mode':           'client_auto',
-        'channel':        'pc',
-        'version':        '1',
-        'Accept':         'application/json',
-        'Content-Type':   'application/json',
-        'User-Agent':     'NULL',
+        'model': device['product_name'], 'infVersion': '1',
+        'operator': device['product_name'], 'nvCarrier': nvc,
+        'uRegion': 'GL', 'trackRegion': 'GL',
+        'imei': '000000000000000', 'imei1': '000000000000000',
+        'deviceId': sha256u("000000000000000"),
+        'mode': 'client_auto', 'channel': 'pc', 'version': '1',
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'User-Agent': 'NULL',
     }
 
-# ─── Send request ─────────────────────────────────────
 def post_ota(url, device, use_ecb=True):
     body_plain = build_body(device)
-    body_str   = json.dumps(body_plain)
-
-    if use_ecb:
-        cipher_text = encrypt_ecb(body_str)
-        payload = json.dumps({"params": cipher_text}).encode('utf-8')
-    else:
-        cipher_text = encrypt_ctr(body_str)
-        payload = json.dumps({"params": cipher_text}).encode('utf-8')
-
+    cipher = encrypt_ecb(json.dumps(body_plain)) if use_ecb else encrypt_ctr(json.dumps(body_plain))
+    payload = json.dumps({"params": cipher}).encode('utf-8')
     headers = build_headers(device)
-    info(f"POST → {url}")
+    info(f"POST → {url}  [{'ECB' if use_ecb else 'CTR'}]")
     try:
         req = urllib.request.Request(url, data=payload, headers=headers, method='POST')
         with urllib.request.urlopen(req, timeout=30) as resp:
             raw = resp.read()
             info(f"HTTP {resp.status} | {len(raw)} bytes")
             if not raw.strip():
-                warn("Response فارغ (204/empty)")
-                return None
-            return json.loads(raw)
+                warn("Response فارغ"); return None, None
+            # طبع raw للـ debug
+            info(f"Raw: {raw[:200]}")
+            return json.loads(raw), use_ecb
     except urllib.error.HTTPError as e:
         body = b""
         try: body = e.read()
         except: pass
-        warn(f"HTTP {e.code} | {len(body)} bytes")
-        if body:
-            info(f"Error body: {body[:300]}")
-        return None
+        warn(f"HTTP {e.code} | body: {body[:150]}")
+        return None, None
     except Exception as e:
-        warn(f"خطأ: {e}")
-        return None
+        warn(f"خطأ: {e}"); return None, None
 
-def parse_and_decrypt(resp_json, use_ecb=True):
-    if not resp_json:
-        return None
-    code = resp_json.get('responseCode', resp_json.get('code', '?'))
+def parse_response(resp_json, use_ecb):
+    if not resp_json: return None
+    # طبع كل الـ keys
+    info(f"JSON keys: {list(resp_json.keys())}")
+    code = resp_json.get('responseCode', resp_json.get('code', resp_json.get('status','?')))
     info(f"responseCode: {code}")
     if code != 200:
         warn(f"errMsg: {resp_json.get('errMsg','')}")
         return None
-    enc = resp_json.get('resps') or resp_json.get('body')
-    if not enc:
-        info(f"Keys في response: {list(resp_json.keys())}")
-        return None
-    try:
-        decrypted = decrypt_ecb(enc) if use_ecb else decrypt_ctr(enc)
-        return json.loads(decrypted)
-    except Exception as e:
-        warn(f"فشل فك التشفير: {e}")
-        return None
-
-def find_dl_url(content):
-    if not isinstance(content, dict):
-        return None
-    # اطبع كل الـ response
-    print(f"{B}{json.dumps(content, indent=2, ensure_ascii=False)[:800]}{RESET}")
-    for k in ["dlUrl","url","componentUrl","fileUrl","downloadUrl","fullDlUrl"]:
-        if content.get(k): return content[k]
-    for comp_key in ["components","component"]:
-        for comp in (content.get(comp_key) or []):
-            for k in ["dlUrl","url","componentUrl","fileUrl"]:
-                if comp.get(k): return comp[k]
+    # جرب كل مفاتيح الـ response المشفر
+    for enc_key in ['resps', 'body', 'data', 'result']:
+        enc = resp_json.get(enc_key)
+        if enc:
+            try:
+                dec = decrypt_ecb(enc) if use_ecb else decrypt_ctr(enc)
+                info(f"فك تشفير '{enc_key}' نجح ✓")
+                return json.loads(dec)
+            except Exception as e:
+                warn(f"فشل فك '{enc_key}': {e}")
+    info(f"Response كامل: {json.dumps(resp_json, ensure_ascii=False)[:400]}")
     return None
 
-# ─── Main OTA search ──────────────────────────────────
+def find_dl_url(content):
+    if not isinstance(content, dict): return None
+    info(f"Content: {json.dumps(content, indent=2, ensure_ascii=False)[:600]}")
+    for k in ["dlUrl","url","componentUrl","fileUrl","downloadUrl","fullDlUrl"]:
+        if content.get(k): return content[k]
+    for ck in ["components","component","list"]:
+        for comp in (content.get(ck) or []):
+            if isinstance(comp, dict):
+                for k in ["dlUrl","url","componentUrl","fileUrl"]:
+                    if comp.get(k): return comp[k]
+    return None
+
+# ─── Search OTA ────────────────────────────────────────
+# جهازك F.42 = أحدث إصدار → نرسل إصدار قديم جداً عشان يرد بـ update
+OLD_OTAS = [
+    # إصدارات قديمة جداً لـ CPH2159 — السيرفر سيرد بالأحدث
+    ("CPH2159_11.A.21_2420_202101270001_000000000001", 1),
+    ("CPH2159_11_A.21_0001_000000000001",              1),
+    ("CPH2159EX_11_A.01_0001_000000000001",            1),
+    ("CPH2159_11.A.01_2420_202001010001_000000000001", 1),
+    # v2 endpoint format
+    ("CPH2159_11.A.21_2420_202101270001_000000000001", 13),
+]
+
+URLS_V1 = [
+    'https://iota.coloros.com/post/Query_Update',
+    'https://ifota.realmemobile.com/post/Query_Update',
+]
+URLS_V2 = [
+    'https://component-ota-f.coloros.com/update/v3',
+    'https://component-otapc-sg.allawnos.com/update/v3',
+]
+
 def search_ota(device):
-    rui = device['rui_version']
+    # 1. جرب v2 endpoints مع الإصدار الحالي وإصدارات قديمة
+    info("جاري تجربة v2 endpoints...")
+    for url in URLS_V2:
+        for ota, rui in OLD_OTAS:
+            d = dict(device); d['ota_version'] = ota; d['rui_version'] = rui
+            resp, enc = post_ota(url, d, use_ecb=False)
+            content = parse_response(resp, False)
+            dl = find_dl_url(content)
+            if dl: return dl
 
-    # RUI 1 → ECB
-    # RUI 2+ → CTR  (جهازك على RUI 13 فنجرب الاثنين)
-    trials = [
-        (URLS['v1_oppo'],  True),
-        (URLS['v1_gl'],    True),
-        (URLS['v1_eu'],    True),
-        (URLS['v2_gl'],    False),
-        (URLS['v2_sg'],    False),
-    ]
-
-    for url, use_ecb in trials:
-        resp = post_ota(url, device, use_ecb)
-        content = parse_and_decrypt(resp, use_ecb)
-        dl = find_dl_url(content)
-        if dl: return dl
-
-    # جرب OTA versions أقدم
-    warn("جاري تجربة OTA versions أقدم مع OPPO URL...")
-    old_otas = [
-        "CPH2159_11.A.21_2420_202101270001_000000000001",
-        "CPH2159EX_11_A.21_210127",
-    ]
-    for ota in old_otas:
-        d2 = dict(device); d2['ota_version'] = ota; d2['rui_version'] = 1
-        for url, ecb in [(URLS['v1_oppo'], True), (URLS['v1_gl'], True)]:
-            resp = post_ota(url, d2, ecb)
-            content = parse_and_decrypt(resp, ecb)
+    # 2. جرب v1 endpoints مع إصدارات قديمة جداً
+    info("جاري تجربة v1 endpoints مع OTA قديمة...")
+    for url in URLS_V1:
+        for ota, rui in OLD_OTAS:
+            d = dict(device); d['ota_version'] = ota; d['rui_version'] = rui if rui == 1 else 1
+            resp, enc = post_ota(url, d, use_ecb=True)
+            content = parse_response(resp, True)
             dl = find_dl_url(content)
             if dl: return dl
 
     return None
 
-# ─── Read device ──────────────────────────────────────
+# ─── Read device ───────────────────────────────────────
 def get_prop(k):
     try:
         r = subprocess.run(["getprop",k], stdout=subprocess.PIPE,
@@ -307,7 +260,7 @@ def read_device():
         success(f"{k}: {v}")
     return {"product_name":pn,"ota_version":ota,"rui_version":rui,"nv_id":nv}
 
-# ─── Download ─────────────────────────────────────────
+# ─── Download ──────────────────────────────────────────
 def download(url, dest):
     info(f"تحميل: {url[:80]}...")
     os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -329,7 +282,7 @@ def download(url, dest):
     except Exception as e:
         print(); error(f"فشل: {e}"); return False
 
-# ─── Extract boot.img ─────────────────────────────────
+# ─── Extract boot.img ──────────────────────────────────
 def extract_boot(zip_path, out_dir):
     info(f"فحص: {os.path.basename(zip_path)}")
     os.makedirs(out_dir, exist_ok=True)
@@ -372,7 +325,7 @@ def next_steps(f):
     print(f"{W}3. fastboot flash boot magisk_patched.img{RESET}")
     print(f"{C}{'═'*46}{RESET}\n")
 
-# ─── Main ─────────────────────────────────────────────
+# ─── Main ──────────────────────────────────────────────
 def main():
     print(BANNER)
     os.makedirs(OUTPUT_DIR, exist_ok=True); os.makedirs(TEMP_DIR, exist_ok=True)
@@ -391,7 +344,7 @@ def main():
 
     step(2, "تجهيز التشفير")
     if not ensure_pycrypto():
-        error("pycryptodome مطلوب — pip install pycryptodome"); sys.exit(1)
+        error("pip install pycryptodome"); sys.exit(1)
 
     step(3, "الاستعلام عن OTA من OPPO")
     dl_url = search_ota(device)
