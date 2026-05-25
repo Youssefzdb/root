@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================
-#  Shadow Core Boot Puller
+#  Shadow Core Boot Puller v2
 #  Device: OPPO Reno 5 CPH2159 | ColorOS
 #  Platform: Termux (Android)
 # ============================================
@@ -12,232 +12,247 @@ import time
 from datetime import datetime
 
 # ─── Colors ───────────────────────────────
-R = "\033[31m"
-G = "\033[32m"
-Y = "\033[33m"
-C = "\033[36m"
-W = "\033[97m"
-B = "\033[90m"
+R  = "\033[31m"
+G  = "\033[32m"
+Y  = "\033[33m"
+C  = "\033[36m"
+W  = "\033[97m"
+B  = "\033[90m"
 RESET = "\033[0m"
-BOLD = "\033[1m"
 
 BANNER = f"""
 {R}╔══════════════════════════════════════╗
-║   {W}Shadow Core Boot Puller{R}            ║
-║   {B}OPPO Reno 5 CPH2159 | ColorOS{R}     ║
+║  {W}Shadow Core Boot Puller  v2{R}        ║
+║  {B}OPPO Reno 5 CPH2159 | ColorOS{R}     ║
 ╚══════════════════════════════════════╝{RESET}
 """
 
-# ─── Boot partitions (CPH2159 MediaTek) ───
-BOOT_PARTITIONS = [
-    "/dev/block/by-name/boot",
-    "/dev/block/by-name/boot_a",
-    "/dev/block/by-name/boot_b",
-    "/dev/block/bootdevice/by-name/boot",
-    "/dev/block/platform/bootdevice/by-name/boot",
-]
-
 OUTPUT_DIR = os.path.expanduser("~/boot_images")
 
-def log(msg, color=W):
-    print(f"{color}[{datetime.now().strftime('%H:%M:%S')}] {msg}{RESET}")
+def success(msg): print(f"{G}[✓] {msg}{RESET}")
+def error(msg):   print(f"{R}[✗] {msg}{RESET}")
+def warn(msg):    print(f"{Y}[!] {msg}{RESET}")
+def info(msg):    print(f"{C}[*] {msg}{RESET}")
 
-def success(msg):
-    print(f"{G}[✓] {msg}{RESET}")
-
-def error(msg):
-    print(f"{R}[✗] {msg}{RESET}")
-
-def warn(msg):
-    print(f"{Y}[!] {msg}{RESET}")
-
-def info(msg):
-    print(f"{C}[*] {msg}{RESET}")
-
-def run(cmd, shell=True, capture=True):
+def run_su(cmd):
+    """تشغيل أمر بصلاحية root وإرجاع (stdout, stderr, returncode)"""
     try:
         result = subprocess.run(
-            cmd, shell=shell,
+            ["su", "-c", cmd],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True
+            text=True,
+            timeout=30
         )
-        return result
-    except Exception as e:
-        return None
+        return result.stdout.strip(), result.stderr.strip(), result.returncode
+    except FileNotFoundError:
+        return "", "su not found", 127
+    except subprocess.TimeoutExpired:
+        return "", "timeout", 1
 
 def check_root():
     info("فحص صلاحيات Root...")
-    result = run("su -c 'id'")
-    if result and "root" in result.stdout:
-        success("Root متاح!")
+    stdout, stderr, code = run_su("id")
+
+    # تحقق حقيقي: الـ output يجب أن يحتوي uid=0
+    if code == 0 and "uid=0" in stdout:
+        success(f"Root متاح! ({stdout.split()[0]})")
         return True
     else:
-        error("Root غير متاح! تأكد من تفعيل Magisk أو SuperSU")
+        error("Root غير متاح!")
+        if "No su program" in stderr or "su not found" in stderr:
+            print(f"\n{Y}الجهاز غير مفتوح (Not Rooted){RESET}")
+            print(f"{W}لتفعيل Root على CPH2159 تحتاج:{RESET}")
+            print(f"  1. فتح bootloader (Unlock OEM)")
+            print(f"  2. تثبيت Magisk عبر Recovery")
+            print(f"  3. تفعيل Magisk في الإعدادات\n")
+        else:
+            error(f"خطأ: {stderr[:100]}")
         return False
 
 def check_dependencies():
     info("فحص الأدوات المطلوبة...")
-    tools = ["dd", "ls", "stat"]
+    tools = ["dd", "ls", "blockdev", "stat"]
     missing = []
+
     for tool in tools:
-        r = run(f"which {tool}")
-        if r and r.returncode == 0:
-            success(f"{tool} موجود")
+        stdout, _, code = run_su(f"which {tool} 2>/dev/null || command -v {tool} 2>/dev/null")
+        if code == 0 and stdout:
+            success(f"{tool} ✓")
         else:
             missing.append(tool)
-            warn(f"{tool} غير موجود")
-    
-    if missing:
-        warn(f"أدوات مفقودة: {', '.join(missing)}")
-        warn("جرب: pkg install coreutils")
+            warn(f"{tool} مفقود")
+
+    if "dd" in missing:
+        print(f"\n{Y}لتثبيت الأدوات:{RESET}")
+        print(f"  {B}pkg install coreutils{RESET}\n")
         return False
+
     return True
 
 def find_boot_partition():
-    info("البحث عن boot partition...")
-    
-    for partition in BOOT_PARTITIONS:
-        result = run(f"su -c 'ls -la {partition} 2>/dev/null'")
-        if result and result.returncode == 0 and partition in result.stdout:
-            success(f"تم العثور على: {partition}")
-            return partition
-    
-    # بحث إضافي
-    info("جاري البحث المتعمق...")
-    result = run("su -c 'ls /dev/block/by-name/ 2>/dev/null | grep boot'")
-    if result and result.stdout.strip():
-        partitions = result.stdout.strip().split('\n')
-        for p in partitions:
-            full_path = f"/dev/block/by-name/{p.strip()}"
-            warn(f"وجدت: {full_path}")
-        
-        # نأخذ الأول
-        first = partitions[0].strip()
-        chosen = f"/dev/block/by-name/{first}"
+    info("البحث عن boot partition للـ CPH2159...")
+
+    # مسارات محتملة لـ MediaTek Helio P95
+    candidates = [
+        "/dev/block/by-name/boot",
+        "/dev/block/by-name/boot_a",
+        "/dev/block/by-name/boot_b",
+        "/dev/block/bootdevice/by-name/boot",
+        "/dev/block/platform/bootdevice/by-name/boot",
+        "/dev/block/mmcblk0p34",
+        "/dev/block/mmcblk0p35",
+    ]
+
+    for path in candidates:
+        stdout, stderr, code = run_su(f"test -e {path} && echo EXISTS")
+        if code == 0 and "EXISTS" in stdout:
+            success(f"تم العثور على: {path}")
+            return path
+
+    # بحث عبر ls فقط في المجلد الصحيح
+    info("بحث متعمق في /dev/block/by-name/...")
+    stdout, stderr, code = run_su("ls /dev/block/by-name/ 2>/dev/null")
+
+    if code != 0 or not stdout or "No su" in stdout or "not found" in stdout.lower():
+        return None
+
+    # فلترة: فقط أسماء صالحة تحتوي كلمة boot
+    valid_partitions = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        # اسم partition صالح: حروف وأرقام و _ و - فقط، وقصير
+        if "boot" in line.lower() and len(line) < 30 and " " not in line:
+            valid_partitions.append(line)
+
+    for name in valid_partitions:
+        full_path = f"/dev/block/by-name/{name}"
+        success(f"وجدت partition: {full_path}")
+
+    if valid_partitions:
+        chosen = f"/dev/block/by-name/{valid_partitions[0]}"
         info(f"سيتم استخدام: {chosen}")
         return chosen
-    
+
     return None
 
 def get_partition_size(partition):
-    result = run(f"su -c 'blockdev --getsize64 {partition} 2>/dev/null'")
-    if result and result.stdout.strip().isdigit():
-        size = int(result.stdout.strip())
-        return size
-    # تقدير افتراضي لـ CPH2159
-    return 67108864  # 64MB
+    stdout, _, code = run_su(f"blockdev --getsize64 {partition} 2>/dev/null")
+    if code == 0 and stdout.isdigit():
+        return int(stdout)
+    return 67108864  # 64MB افتراضي
 
 def pull_boot(partition):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_file = os.path.join(OUTPUT_DIR, f"boot_CPH2159_{timestamp}.img")
-    
-    info(f"جاري سحب boot.img من {partition}")
-    info(f"سيتم الحفظ في: {output_file}")
-    
+
     size = get_partition_size(partition)
     size_mb = size / (1024 * 1024)
-    info(f"حجم الـ partition: ~{size_mb:.1f} MB")
-    
+
+    info(f"جاري سحب boot.img من: {partition}")
+    info(f"الحجم التقريبي: {size_mb:.1f} MB")
+    info(f"مسار الحفظ: {output_file}")
+
     print(f"\n{Y}{'═'*42}{RESET}")
-    
-    cmd = f"su -c 'dd if={partition} of={output_file} bs=4096 2>&1'"
-    
-    start_time = time.time()
-    result = run(cmd)
-    elapsed = time.time() - start_time
-    
+
+    start = time.time()
+    stdout, stderr, code = run_su(
+        f"dd if={partition} of={output_file} bs=4096"
+    )
+    elapsed = time.time() - start
+
     print(f"{Y}{'═'*42}{RESET}\n")
-    
-    if result and os.path.exists(output_file):
-        file_size = os.path.getsize(output_file)
-        if file_size > 0:
-            success(f"تم السحب بنجاح!")
-            success(f"الملف: {output_file}")
-            success(f"الحجم: {file_size / (1024*1024):.2f} MB")
-            success(f"الوقت: {elapsed:.1f} ثانية")
-            
-            # تحقق من magic bytes
-            verify_boot_image(output_file)
-            return output_file
-        else:
-            error("الملف فارغ! فشل السحب.")
-            return None
-    else:
-        error("فشل السحب!")
-        if result:
-            error(f"الخطأ: {result.stderr[:200]}")
+
+    if not os.path.exists(output_file) or os.path.getsize(output_file) == 0:
+        error("فشل السحب — الملف غير موجود أو فارغ")
+        if stderr:
+            error(f"تفاصيل: {stderr[:200]}")
         return None
+
+    file_size = os.path.getsize(output_file)
+    success(f"تم السحب بنجاح!")
+    success(f"الملف: {output_file}")
+    success(f"الحجم: {file_size / (1024*1024):.2f} MB")
+    success(f"الوقت: {elapsed:.1f} ثانية")
+
+    verify_boot_image(output_file)
+    return output_file
 
 def verify_boot_image(filepath):
     info("التحقق من صحة الملف...")
-    with open(filepath, 'rb') as f:
-        magic = f.read(8)
-    
-    # Android boot magic: ANDROID!
-    if magic[:8] == b'ANDROID!':
-        success("✅ ملف boot.img صحيح! (Magic: ANDROID!)")
-    elif magic[:3] == b'\x1f\x8b\x08':
-        warn("الملف مضغوط (gzip) — قد يكون boot kernel مباشرة")
-    else:
-        warn(f"Magic bytes غير معروفة: {magic.hex()}")
-        warn("قد يكون الملف صحيحاً لكن بصيغة مختلفة")
+    try:
+        with open(filepath, 'rb') as f:
+            magic = f.read(8)
+        if magic[:8] == b'ANDROID!':
+            success("ملف boot.img صحيح ✅ (Magic: ANDROID!)")
+        elif magic[:3] == b'\x1f\x8b\x08':
+            warn("الملف مضغوط gzip")
+        else:
+            warn(f"Magic غير معروف: {magic.hex()} — قد يكون صحيحاً")
+    except Exception as e:
+        warn(f"تعذر التحقق: {e}")
 
 def show_next_steps(output_file):
     print(f"\n{C}{'═'*42}")
-    print(f"  الخطوات التالية:")
+    print(f"  الخطوات التالية")
     print(f"{'═'*42}{RESET}")
-    print(f"{W}1. نقل الملف للكمبيوتر:{RESET}")
-    print(f"   {B}adb pull {output_file}{RESET}")
-    print(f"{W}2. فك تشفير الـ boot.img:{RESET}")
-    print(f"   {B}magiskboot unpack boot.img{RESET}")
-    print(f"{W}3. التحقق من الملف:{RESET}")
-    print(f"   {B}file {output_file}{RESET}")
+    print(f"{W}نقل للكمبيوتر:{RESET}")
+    print(f"  {B}adb pull {output_file}{RESET}")
+    print(f"{W}فك تشفير الـ boot.img:{RESET}")
+    print(f"  {B}magiskboot unpack boot.img{RESET}")
+    print(f"{W}التحقق من نوع الملف:{RESET}")
+    print(f"  {B}file {output_file}{RESET}")
     print(f"{C}{'═'*42}{RESET}\n")
 
 def main():
     print(BANNER)
-    
-    print(f"{B}الجهاز المستهدف: OPPO Reno 5 CPH2159{RESET}")
-    print(f"{B}النظام: ColorOS | المعالج: MediaTek Helio P95{RESET}\n")
-    
-    # فحص Root
+    print(f"{B}الجهاز: OPPO Reno 5 CPH2159 | ColorOS | Helio P95{RESET}\n")
+
+    # 1. تحقق من Root
     if not check_root():
         sys.exit(1)
-    
-    # فحص الأدوات
-    check_dependencies()
-    
+
     print()
-    
-    # إيجاد partition
+
+    # 2. تحقق من الأدوات
+    if not check_dependencies():
+        sys.exit(1)
+
+    print()
+
+    # 3. ابحث عن الـ partition
     partition = find_boot_partition()
     if not partition:
         error("لم يتم العثور على boot partition!")
-        error("تأكد من أن الجهاز لديه صلاحيات root كاملة")
+        error("تأكد من أن Root يعمل بشكل كامل")
         sys.exit(1)
-    
+
     print()
-    
-    # تأكيد
+
+    # 4. تأكيد المستخدم
     print(f"{Y}سيتم سحب boot.img من: {partition}{RESET}")
-    confirm = input(f"{W}هل تريد المتابعة؟ (y/n): {RESET}").strip().lower()
-    
+    try:
+        confirm = input(f"{W}هل تريد المتابعة؟ (y/n): {RESET}").strip().lower()
+    except KeyboardInterrupt:
+        print()
+        warn("تم الإلغاء.")
+        sys.exit(0)
+
     if confirm not in ['y', 'yes', 'نعم', 'ي']:
         warn("تم الإلغاء.")
         sys.exit(0)
-    
+
     print()
-    
-    # السحب
+
+    # 5. سحب الـ boot
     output = pull_boot(partition)
-    
+
     if output:
         show_next_steps(output)
         success("🖤 Shadow Core — مهمة مكتملة")
     else:
-        error("فشلت العملية. تحقق من صلاحيات Root")
+        error("فشلت العملية.")
         sys.exit(1)
 
 if __name__ == "__main__":
