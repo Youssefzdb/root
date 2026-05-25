@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 # ============================================
-#  Shadow Core Boot Puller v11
+#  Shadow Core Boot Puller v12
 #  Device: OPPO Reno 5 CPH2159 | Helio P95
 #
 #  Method Chain (Auto Fallback):
-#    1. Root/KernelSU   → dd partition
-#    2. PHH-GSI via DSU → su → dd partition
-#    3. MTK DA Bypass   → dump via preloader
-#
-#  CPH2159 supports Project Treble → DSU works
+#    1. Root / KernelSU  → dd partition
+#    2. DSU Sideloader   → PHH GSI → su → dd
+#    3. MTK DA Bypass    → PC guide
 # ============================================
 
 import subprocess, sys, os, re, shutil, time, json
@@ -20,13 +18,27 @@ C="\033[36m"; W="\033[97m"; B="\033[90m"; RESET="\033[0m"
 
 BANNER = f"""
 {R}╔══════════════════════════════════════════════╗
-║  {W}Shadow Core Boot Puller  v11{R}              ║
+║  {W}Shadow Core Boot Puller  v12{R}              ║
 ║  {B}OPPO Reno 5 CPH2159 | Helio P95{R}          ║
 ║  {B}3-Method Chain | Auto Fallback{R}            ║
 ╚══════════════════════════════════════════════╝{RESET}
 """
 
-OUTPUT_DIR = os.path.expanduser("~/boot_images")
+OUTPUT_DIR  = os.path.expanduser("~/boot_images")
+TOOLS_DIR   = os.path.expanduser("~/boot_images/tools")
+STORAGE_DIR = os.path.expanduser("/sdcard/Download")
+
+DSU_APK_URL = "https://github.com/VegaBobo/DSU-Sideloader/releases/download/2.03/app-release.apk"
+DSU_MOD_URL = "https://github.com/VegaBobo/DSU-Sideloader/releases/download/2.03/module_DSU_Sideloader.zip"
+DSU_APK_NAME = "DSU-Sideloader-2.03.apk"
+DSU_MOD_NAME = "DSU-Sideloader-module.zip"
+
+# أفضل GSI لـ CPH2159: arm64 + A/B + vanilla (أصغر) + بدون secure (له su)
+# system-squeak-arm64-ab-vanilla = 578MB ← لا يحتوي su!
+# نحتاج floss (= free software = له su بداخله)
+GSI_URL  = "https://github.com/phhusson/treble_experimentations/releases/download/v416/system-squeak-arm64-ab-floss.img.xz"
+GSI_NAME = "phh-gsi-arm64-ab-floss-v416.img.xz"
+GSI_SIZE_MB = 842
 
 def success(m): print(f"{G}[✓] {m}{RESET}")
 def error(m):   print(f"{R}[✗] {m}{RESET}")
@@ -47,6 +59,35 @@ def run(cmd, timeout=15):
 
 def exists_bin(b): return shutil.which(b) is not None
 
+def download_file(url, dest, label=""):
+    """تحميل ملف مع progress bar"""
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    info(f"تحميل {label or os.path.basename(dest)}...")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            total = int(resp.headers.get("Content-Length", 0))
+            done  = 0
+            with open(dest, 'wb') as f:
+                while True:
+                    buf = resp.read(512 * 1024)
+                    if not buf: break
+                    f.write(buf)
+                    done += len(buf)
+                    if total:
+                        pct = done / total * 100
+                        bar = "█" * int(pct/5) + "░" * (20 - int(pct/5))
+                        print(f"\r  {C}[{bar}] {pct:.0f}% — {done//1024//1024}/{total//1024//1024} MB{RESET}",
+                              end="", flush=True)
+        print()
+        size = os.path.getsize(dest)
+        success(f"تم: {size//1024//1024} MB → {dest}")
+        return True
+    except Exception as e:
+        print()
+        error(f"فشل التحميل: {e}")
+        return False
+
 # ─── Shared Utils ──────────────────────────────────
 def find_boot_partition(use_su=False):
     pfx = "su -c " if use_su else ""
@@ -60,21 +101,24 @@ def find_boot_partition(use_su=False):
         if rc == 0 and out.startswith("/dev/"):
             return out
 
-    # scan by-name
+    # bash find (XDA method)
+    cmd = (r'for P in boot boot_a boot_b; do '
+           r'B=$(find /dev/block \( -type b -o -type c -o -type l \) '
+           r'-iname "$P" -print -quit 2>/dev/null); '
+           r'[ -n "$B" ] && echo "$P=$(readlink -f $B)"; done')
+    out, _, _ = run(f"{pfx}sh -c '{cmd}'")
+    for line in out.split("\n"):
+        if '=' in line:
+            _, path = line.split('=', 1)
+            if path.strip().startswith('/dev/'):
+                return path.strip()
+
+    # ls -la by-name fallback
     out, _, _ = run(f"{pfx}ls -la /dev/block/by-name/ 2>/dev/null")
     for line in out.split("\n"):
         if re.search(r'\bboot\b', line, re.I) and '->' in line:
             t = line.split('->')[-1].strip()
             return t if t.startswith('/dev/') else f"/dev/block/{t.split('/')[-1]}"
-
-    # bash find (from XDA guide)
-    cmd = r"""for P in boot boot_a boot_b; do B=$(find /dev/block \( -type b -o -type c -o -type l \) -iname "$P" -print -quit 2>/dev/null); [ -n "$B" ] && echo "$P=$(readlink -f $B)"; done"""
-    out, _, _ = run(f"{pfx}sh -c '{cmd}'")
-    for line in out.split("\n"):
-        if '=' in line:
-            part, path = line.split('=', 1)
-            if path.strip().startswith('/dev/'):
-                return path.strip()
     return None
 
 def dd_extract(partition, outfile, use_su=False):
@@ -82,18 +126,26 @@ def dd_extract(partition, outfile, use_su=False):
     pfx = "su -c " if use_su else ""
     cmd = f"{pfx}dd if={partition} of={outfile} bs=4096"
     info(f"تشغيل: {cmd}")
-    out, err, rc = run(cmd, timeout=180)
-    combined = (out + " " + err).strip()
-    info(f"نتيجة: {combined[:120]}")
-    return os.path.exists(outfile) and os.path.getsize(outfile) > 512*1024
+    _, _, _ = run(cmd, timeout=180)
+    if os.path.exists(outfile) and os.path.getsize(outfile) > 512*1024:
+        return True
+    # جرب حفظ في /sdcard أيضاً
+    sdcard_out = os.path.join(STORAGE_DIR, os.path.basename(outfile))
+    cmd2 = f"{pfx}dd if={partition} of={sdcard_out} bs=4096"
+    _, _, _ = run(cmd2, timeout=180)
+    if os.path.exists(sdcard_out) and os.path.getsize(sdcard_out) > 512*1024:
+        shutil.copy2(sdcard_out, outfile)
+        return True
+    return False
 
 def verify(f):
     try:
-        with open(f,'rb') as fp: magic = fp.read(8)
+        with open(f, 'rb') as fp:
+            magic = fp.read(8)
         if magic[:8] == b'ANDROID!':
-            success(f"boot.img صحيح ✅  — {os.path.getsize(f)//1024//1024} MB")
+            success(f"boot.img صحيح ✅  Magic: ANDROID! — {os.path.getsize(f)//1024//1024} MB")
             return True
-        warn(f"Magic غير معروف: {magic.hex()}")
+        warn(f"Magic: {magic.hex()} — تحقق يدوياً")
         return True
     except: return False
 
@@ -102,14 +154,11 @@ def verify(f):
 #  METHOD 1 — Root / KernelSU / su
 # ══════════════════════════════════════════════════
 def method1_root(outfile):
-    banner2("الطريقة 1: KernelSU / Root → dd partition")
+    banner2("الطريقة 1: Root / KernelSU → dd partition")
 
-    # هل نحن root؟
     uid_out, _, _ = run("id")
     is_root = "uid=0" in uid_out
-
-    # هل su متاح؟
-    su_out, _, su_rc = run("su -c id", timeout=8)
+    su_out, _, _ = run("su -c id", timeout=8)
     has_su = "uid=0" in su_out
 
     if not is_root and not has_su:
@@ -119,183 +168,210 @@ def method1_root(outfile):
     use_su = not is_root
     success(f"{'su متاح' if use_su else 'root مباشر'}!")
 
+    # active slot
+    slot, _, _ = run("getprop ro.boot.slot_suffix")
+    info(f"Active slot: {slot or 'A-only'}")
+
     partition = find_boot_partition(use_su=use_su)
-    if not partition:
-        # جرب active slot
-        slot, _, _ = run("getprop ro.boot.slot_suffix")
-        if slot:
-            pfx = "su -c " if use_su else ""
-            out, _, _ = run(f"{pfx}readlink -f /dev/block/by-name/boot{slot} 2>/dev/null")
-            if out.startswith('/dev/'): partition = out
+    if not partition and slot:
+        pfx = "su -c " if use_su else ""
+        out, _, _ = run(f"{pfx}readlink -f /dev/block/by-name/boot{slot} 2>/dev/null")
+        if out.startswith('/dev/'): partition = out
+
     if not partition:
         warn("لم يُعثر على boot partition")
         return False
 
     success(f"Boot partition: {partition}")
-    return dd_extract(partition, outfile, use_su=use_su)
+    if dd_extract(partition, outfile, use_su=use_su):
+        return True
+    warn("dd فشل")
+    return False
 
 
 # ══════════════════════════════════════════════════
-#  METHOD 2 — PHH GSI via DSU → su → dd
+#  METHOD 2 — DSU Sideloader + PHH GSI → su → dd
 # ══════════════════════════════════════════════════
-def method2_gsi_dsu(outfile):
-    banner2("الطريقة 2: PHH GSI عبر DSU → su → dd")
+def method2_dsu(outfile):
+    banner2("الطريقة 2: DSU Sideloader + PHH GSI → su → dd")
 
+    os.makedirs(TOOLS_DIR, exist_ok=True)
+
+    # ─── فحص Treble ───
     info("فحص Project Treble...")
-    treble, _, _ = run("getprop ro.treble.enabled")
-    vndk, _, _   = run("getprop ro.vndk.version")
+    treble, _, _  = run("getprop ro.treble.enabled")
     ab_update, _, _ = run("getprop ro.build.ab_update")
-    slot, _, _   = run("getprop ro.boot.slot_suffix")
-    arch, _, _   = run("uname -m")
+    slot, _, _    = run("getprop ro.boot.slot_suffix")
+    sdk, _, _     = run("getprop ro.build.version.sdk")
+    brand, _, _   = run("getprop ro.product.system.brand")
 
-    info(f"Treble: {treble} | VNDK: {vndk} | A/B: {ab_update} | Slot: {slot} | Arch: {arch}")
+    info(f"Treble={treble} | A/B={ab_update} | slot={slot} | SDK={sdk} | brand={brand}")
 
-    if treble != "true":
-        warn("Treble غير مدعوم على هذا الجهاز → الانتقال للطريقة 3")
-        return False
-
-    # CPH2159 = arm64, A/B = true
-    is_ab = ab_update == "true" or bool(slot)
-    part_type = "b" if is_ab else "a"
-    gsi_name = f"arm64_{part_type}vS"  # arm64 + partition_type + vanilla + Superuser
-
-    # PHH GSI releases API
-    info("جلب أحدث PHH GSI release...")
-    try:
-        url = "https://api.github.com/repos/phhusson/treble_experimentations/releases/latest"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read())
-        assets = data.get("assets", [])
-        tag    = data.get("tag_name", "?")
-        info(f"أحدث release: {tag} ({len(assets)} ملف)")
-
-        # ابحث عن arm64_bvS (vanilla + Superuser + A/B)
-        gsi_asset = None
-        for a in assets:
-            n = a["name"].lower()
-            if "arm64" in n and "vs" in n and a["name"].endswith(".img.xz"):
-                gsi_asset = a
-                break
-        if not gsi_asset:
-            for a in assets:
-                n = a["name"].lower()
-                if "arm64" in n and n.endswith(".img.xz"):
-                    gsi_asset = a
-                    break
-
-        if not gsi_asset:
-            warn("لم يُعثر على GSI مناسب في الـ release")
-        else:
-            info(f"GSI: {gsi_asset['name']} ({gsi_asset['size']//1024//1024} MB)")
-    except Exception as e:
-        warn(f"فشل جلب GSI releases: {e}")
-        gsi_asset = None
-
-    # ─── طباعة التعليمات الكاملة بدلاً من التنزيل التلقائي ───
-    # (الـ GSI حجمه ~800MB — أثقل من أن ينزله السكريبت)
-    print(f"""
-{Y}{'═'*54}
-  ► الطريقة 2 تحتاج خطوة يدوية واحدة (5 دقائق)
-{'═'*54}{RESET}
-
-{W}الخطوة 1 — تحقق من Treble:{RESET}
-  {G}✓ جهازك يدعم Project Treble (مؤكد){RESET}
-
-{W}الخطوة 2 — ثبّت DSU Sideloader:{RESET}
-  {B}https://play.google.com/store/apps/details?id=vegabobo.dsusideloader{RESET}
-  أو حمّله من هنا مباشرة (بدون Play Store):
-  {B}https://github.com/VegaBobo/DSU-Sideloader/releases/latest{RESET}
-
-{W}الخطوة 3 — حمّل PHH GSI (arm64 + Superuser):{RESET}""")
-
-    if gsi_asset:
-        print(f"  {B}{gsi_asset['browser_download_url']}{RESET}")
-        print(f"  الحجم: {gsi_asset['size']//1024//1024} MB")
-    else:
-        print(f"  {B}https://github.com/phhusson/treble_experimentations/releases/latest{RESET}")
-        print(f"  اختر: arm64_bvS-*.img.xz")
-
-    print(f"""
-{W}الخطوة 4 — ثبّت GSI عبر DSU Sideloader:{RESET}
-  • افتح DSU Sideloader
-  • اختر الـ .img.xz
-  • اضغط Install → الجهاز يُعيد التشغيل في GSI مؤقتاً
-
-{W}الخطوة 5 — بعد التشغيل في GSI:{RESET}
-  {G}pkg update && git pull{RESET}
-  {G}python boot_pull.py{RESET}
-  (الآن الطريقة 1 ستنجح تلقائياً بـ su من PHH)
-
-{Y}ملاحظة: GSI مؤقت — الجهاز يعود لـ ColorOS عند الإقلاع العادي{RESET}
-""")
-
-    # هل نحن الآن داخل GSI؟
+    # ─── هل نحن الآن داخل PHH GSI؟ ───
     flavor, _, _ = run("getprop ro.system.build.flavor")
-    treble_ver, _, _ = run("getprop ro.product.system.brand")
-    info(f"system.brand: {treble_ver}")
-    if "phh" in flavor.lower() or "treble" in flavor.lower():
-        success("أنت الآن داخل PHH GSI!")
-        # جرب su
+    phh_app, _, _ = run("pm list packages 2>/dev/null | grep me.phh.superuser")
+
+    if "phh" in flavor.lower() or "treble" in flavor.lower() or phh_app:
+        success("✅ أنت داخل PHH GSI!")
         su_test, _, _ = run("su -c id", timeout=8)
         if "uid=0" in su_test:
             success("su يعمل! جاري الاستخراج...")
             partition = find_boot_partition(use_su=True)
             if partition:
+                success(f"Boot partition: {partition}")
                 return dd_extract(partition, outfile, use_su=True)
+            else:
+                error("لم يُعثر على boot partition حتى داخل GSI")
+                return False
+        else:
+            warn("su غير متاح داخل GSI — تحقق من PHH Superuser app")
+            return False
 
-    return False
+    # ─── لم نكن في GSI بعد → نُحضّر الملفات ───
+    if treble != "true":
+        warn("جهازك لا يدعم Project Treble — DSU لن يعمل")
+        return False
 
+    success(f"Treble مدعوم! SDK={sdk}")
 
-# ══════════════════════════════════════════════════
-#  METHOD 3 — MTK DA Bypass (Preloader exploit)
-#  MT6779 / Helio P95
-# ══════════════════════════════════════════════════
-def method3_mtk_bypass(outfile):
-    banner2("الطريقة 3: MTK DA Bypass (Helio P95 / MT6779)")
+    # ─── تحميل DSU Sideloader APK ───
+    apk_path = os.path.join(TOOLS_DIR, DSU_APK_NAME)
+    apk_sdcard = os.path.join(STORAGE_DIR, DSU_APK_NAME)
 
-    info("هذه الطريقة تحتاج PC متصل بالجهاز عبر USB.")
-    info("لكن يمكن تحضير الأداة من Termux الآن.")
-
-    # فحص هل mtkclient متاح
-    if not exists_bin("mtkclient"):
-        info("تحضير mtkclient...")
-        # جرب pip
-        out, err, rc = run("pip install mtkclient 2>&1 | tail -3", timeout=60)
-        info(f"pip: {out[-100:]}")
-
-    # فحص /dev/ttyUSB أو /dev/ttyACM (لو كان في PC متصل)
-    tty_devs = [d for d in ["/dev/ttyUSB0","/dev/ttyUSB1","/dev/ttyACM0"] if os.path.exists(d)]
-    if tty_devs:
-        success(f"وجد USB serial: {tty_devs}")
+    if not os.path.exists(apk_path) and not os.path.exists(apk_sdcard):
+        info("تحميل DSU Sideloader APK...")
+        if not download_file(DSU_APK_URL, apk_path, "DSU Sideloader v2.03 APK"):
+            warn("فشل تحميل DSU APK")
     else:
-        info("لا يوجد USB serial device (متوقع في Termux بدون PC)")
+        success(f"DSU APK موجود مسبقاً")
+        apk_path = apk_path if os.path.exists(apk_path) else apk_sdcard
+
+    # انسخ APK للـ sdcard
+    sdcard_apk = os.path.join(STORAGE_DIR, DSU_APK_NAME)
+    if os.path.exists(apk_path) and not os.path.exists(sdcard_apk):
+        try:
+            shutil.copy2(apk_path, sdcard_apk)
+            success(f"APK في: {sdcard_apk}")
+        except Exception as e:
+            warn(f"نسخ APK: {e}")
+
+    # ─── تحميل PHH GSI ───
+    gsi_path    = os.path.join(TOOLS_DIR, GSI_NAME)
+    gsi_sdcard  = os.path.join(STORAGE_DIR, GSI_NAME)
+
+    if os.path.exists(gsi_path):
+        success(f"PHH GSI موجود: {gsi_path}")
+    elif os.path.exists(gsi_sdcard):
+        success(f"PHH GSI موجود: {gsi_sdcard}")
+        gsi_path = gsi_sdcard
+    else:
+        print(f"\n{Y}PHH GSI حجمه {GSI_SIZE_MB} MB.{RESET}")
+        print(f"{W}هل تريد تحميله الآن؟ (y/n) [n=تخطي وأرى التعليمات]: {RESET}", end="", flush=True)
+        try:
+            choice = input().strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            choice = 'n'
+
+        if choice == 'y':
+            # حاول الحفظ في sdcard أولاً (مساحة أكبر)
+            save_to = gsi_sdcard if os.path.exists(STORAGE_DIR) else gsi_path
+            if not download_file(GSI_URL, save_to, f"PHH GSI v416 arm64-ab-floss ({GSI_SIZE_MB} MB)"):
+                warn("فشل تحميل GSI")
+            else:
+                gsi_path = save_to
+
+    # ─── تعليمات التثبيت ───
+    print(f"""
+{C}{'═'*54}
+  خطوات تثبيت DSU + PHH GSI
+{'═'*54}{RESET}
+
+{W}الملفات المُحمّلة:{RESET}""")
+
+    if os.path.exists(sdcard_apk):
+        print(f"  {G}✓ DSU Sideloader APK:{RESET} {B}{sdcard_apk}{RESET}")
+    else:
+        print(f"  {Y}⚠ DSU APK لم يُحمَّل — نزّله من:{RESET}")
+        print(f"    {B}{DSU_APK_URL}{RESET}")
+
+    if os.path.exists(gsi_path):
+        print(f"  {G}✓ PHH GSI:{RESET} {B}{gsi_path}{RESET}")
+    else:
+        print(f"  {Y}⚠ PHH GSI لم يُحمَّل — نزّله من:{RESET}")
+        print(f"    {B}{GSI_URL}{RESET}")
+
+    # تثبيت APK تلقائياً
+    if os.path.exists(sdcard_apk):
+        info("محاولة تثبيت DSU APK تلقائياً...")
+        out, err, rc = run(f"pm install -r {sdcard_apk}", timeout=30)
+        if rc == 0 or "success" in out.lower():
+            success("DSU Sideloader مُثبَّت! ✅")
+        else:
+            info(f"pm install: {out or err}")
+
+    print(f"""
+{W}الخطوات اليدوية (مرة واحدة فقط):{RESET}
+
+{W}1. ثبّت DSU Sideloader APK:{RESET}
+   {B}• افتح مدير الملفات → {sdcard_apk if os.path.exists(sdcard_apk) else 'Download/'+DSU_APK_NAME}{RESET}
+   {B}• اضغط على الملف وثبّته (قد تحتاج تفعيل "مصادر غير معروفة"){RESET}
+
+{W}2. افتح DSU Sideloader وحدد الـ GSI:{RESET}
+   {B}• اختر الملف: {gsi_path if os.path.exists(gsi_path) else 'PHH GSI .img.xz'}{RESET}
+   {B}• اضغط Install (سيأخذ وقتاً){RESET}
+   {B}• الجهاز سيُعيد التشغيل في GSI مؤقتاً{RESET}
+
+{W}3. بعد الإقلاع في GSI — شغّل هذه الأداة مجدداً:{RESET}
+   {B}cd ~/root-cli && git pull && python boot_pull.py{RESET}
+   {G}← الطريقة 1 ستنجح تلقائياً بـ su من PHH{RESET}
+
+{Y}ملاحظة: GSI مؤقت 100% — الجهاز يعود لـ ColorOS عند الإقلاع العادي{RESET}
+""")
+
+    return False  # لن ننجح الآن، لكن الملفات جاهزة
+
+
+# ══════════════════════════════════════════════════
+#  METHOD 3 — MTK DA Bypass (PC required)
+# ══════════════════════════════════════════════════
+def method3_mtk(outfile):
+    banner2("الطريقة 3: MTK DA Bypass — Helio P95 (MT6779)")
+
+    # فحص هل mtkclient متاح محلياً (لو شغّلها من PC)
+    if exists_bin("mtk") or exists_bin("mtkclient"):
+        success("mtkclient موجود!")
+        # فحص USB device
+        tty_devs = [d for d in ["/dev/ttyUSB0","/dev/ttyUSB1","/dev/ttyACM0"] if os.path.exists(d)]
+        if tty_devs:
+            success(f"USB serial: {tty_devs[0]}")
+            info("جاري محاولة dump boot...")
+            out, err, rc = run(f"mtk r boot {outfile}", timeout=120)
+            info(f"mtkclient: {(out+err)[:150]}")
+            if os.path.exists(outfile) and os.path.getsize(outfile) > 512*1024:
+                return True
 
     print(f"""
 {R}{'═'*54}
   الطريقة 3: MTK DA Bypass — يحتاج PC
 {'═'*54}{RESET}
 
-{W}هذه الطريقة هي الأقوى لكنها تحتاج PC:{RESET}
-
-{W}الخطوة 1 — على الـ PC:{RESET}
+{W}على الـ PC:{RESET}
   {B}pip install mtkclient{RESET}
 
-{W}الخطوة 2 — أدخل الجهاز في BROM mode:{RESET}
-  • أطفئ الجهاز تماماً
-  • اضغط Volume Down واحتفظ به
-  • وصّل USB بالـ PC
+{W}أدخل الجهاز في BROM mode:{RESET}
+  {Y}• أطفئ الجهاز تماماً{RESET}
+  {Y}• اضغط Volume Down واحتفظ به{RESET}
+  {Y}• وصّل USB بالـ PC{RESET}
 
-{W}الخطوة 3 — من PC terminal:{RESET}
+{W}من PC terminal:{RESET}
   {B}python -m mtk r boot boot.img{RESET}
 
-{W}الخطوة 4 — انقل boot.img للجهاز:{RESET}
+{W}انقل boot.img للجهاز:{RESET}
   {B}adb push boot.img /sdcard/Download/{RESET}
 
-{G}MT6779 (Helio P95) = مدعوم في mtkclient ✓{RESET}
+{G}✓ MT6779 / Helio P95 = مدعوم في mtkclient{RESET}
 {B}https://github.com/bkerler/mtkclient{RESET}
 """)
-
     return False
 
 
@@ -305,21 +381,24 @@ def method3_mtk_bypass(outfile):
 def main():
     print(BANNER)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(TOOLS_DIR, exist_ok=True)
 
-    # معلومات سريعة
-    info("جمع معلومات الجهاز...")
+    step(0, "معلومات الجهاز")
+    props = {}
     for prop in ["ro.product.name", "ro.build.version.ota", "ro.boot.slot_suffix",
-                 "ro.treble.enabled", "ro.boot.flash.locked"]:
+                 "ro.treble.enabled", "ro.boot.flash.locked", "ro.build.ab_update",
+                 "ro.build.version.sdk"]:
         val, _, _ = run(f"getprop {prop}")
-        info(f"  {prop}: {val}")
+        props[prop] = val
+        info(f"  {prop.split('.')[-1]}: {val}")
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     outfile = os.path.join(OUTPUT_DIR, f"boot_CPH2159_{ts}.img")
 
     methods = [
-        ("Root / KernelSU + dd",   method1_root),
-        ("PHH GSI via DSU + su",   method2_gsi_dsu),
-        ("MTK DA Bypass (PC)",     method3_mtk_bypass),
+        ("Root / KernelSU + dd",          method1_root),
+        ("DSU Sideloader + PHH GSI + su",  method2_dsu),
+        ("MTK DA Bypass (PC)",             method3_mtk),
     ]
 
     for i, (name, func) in enumerate(methods, 1):
@@ -337,15 +416,15 @@ def main():
             success(f"الحجم: {os.path.getsize(outfile)/1024/1024:.2f} MB")
             verify(outfile)
             print(f"""
-{C}{'═'*50}
+{C}{'═'*52}
   🖤 الخطوات التالية — Root بـ Magisk
-{'═'*50}{RESET}
+{'═'*52}{RESET}
 {W}1. ثبّت Magisk:{RESET}
    {B}https://github.com/topjohnwu/Magisk/releases{RESET}
-{W}2. Magisk → Install → Patch a File → {B}{outfile}{RESET}
-{W}3. فلّش الناتج:{RESET}
+{W}2. Magisk → Install → Patch a File → اختر boot.img{RESET}
+{W}3. فلّش:{RESET}
    {B}fastboot flash boot magisk_patched.img{RESET}
-{C}{'═'*50}{RESET}
+{C}{'═'*52}{RESET}
 """)
             success("🖤 Shadow Core — مهمة مكتملة")
             return
@@ -354,8 +433,9 @@ def main():
             warn(f"الطريقة {i} فشلت → جاري تجربة الطريقة {i+1}...")
             time.sleep(0.3)
 
-    print(f"\n{R}[✗] جميع الطرق الثلاث فشلت تلقائياً.{RESET}")
-    print(f"{W}اتبع تعليمات الطريقة 2 (DSU) أو الطريقة 3 (PC+mtkclient){RESET}\n")
+    print(f"\n{R}[✗] لم تنجح الطرق الثلاث تلقائياً.{RESET}")
+    print(f"{W}اتبع تعليمات الطريقة 2 (DSU) الموضحة أعلاه — الخطوات بسيطة{RESET}\n")
+
 
 if __name__ == "__main__":
     main()
