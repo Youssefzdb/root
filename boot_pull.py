@@ -85,7 +85,10 @@ def read_device_info():
     final = {}
     final["product_name"] = props["product_name"] or DEVICE_INFO["product_name"]
     final["ota_version"]  = props["ota_version"]  or DEVICE_INFO["ota_version"]
-    final["rui_version"]  = int(props["rui_version"] or DEVICE_INFO["rui_version"])
+    # استخرج أول رقم من القيمة (مثال: "V13.0.0" → 13, "2" → 2)
+    rui_raw = props["rui_version"] or str(DEVICE_INFO["rui_version"])
+    rui_match = re.search(r'\d+', rui_raw)
+    final["rui_version"] = int(rui_match.group()) if rui_match else DEVICE_INFO["rui_version"]
     final["nv_id"]        = props["nv_id"] or DEVICE_INFO["nv_id"]
     final["region"]       = DEVICE_INFO["region"]
 
