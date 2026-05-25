@@ -10,17 +10,17 @@
 
 ## التثبيت
 ```bash
-pkg update && pkg install python
+pkg update && pkg install python git
 git clone https://github.com/Youssefzdb/root
 cd root
 python boot_pull.py
 ```
 
 ## الميزات
-- 🔍 كشف تلقائي لـ boot partition
-- ✅ التحقق من صحة الملف (Magic bytes)
-- 📁 حفظ منظم مع timestamp
-- 🎨 واجهة ملونة وتفاعلية
+- كشف تلقائي لـ boot partition
+- التحقق من صحة الملف (Magic bytes)
+- حفظ منظم مع timestamp
+- واجهة ملونة وتفاعلية
 
 ## الجهاز المستهدف
 | المعلومة | القيمة |
