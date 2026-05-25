@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 # ============================================
-#  Shadow Core Boot Puller v3
+#  Shadow Core Boot Puller v4
 #  Device: OPPO Reno 5 CPH2159 | ColorOS
-#  Platform: Termux (Android) — No Root needed
-#  Method: Extract boot.img from OFP/ZIP ROM
+#  Platform: Termux — No Root, No PC
+#  Method: Download OTA from OPPO servers
+#          + Extract boot.img automatically
 # ============================================
 
 import subprocess
 import sys
 import os
+import json
 import zipfile
 import shutil
 import struct
-import tempfile
+import hashlib
+import urllib.request
+import urllib.error
 from datetime import datetime
 
 # ─── Colors ───────────────────────────────
@@ -25,311 +29,488 @@ B  = "\033[90m"
 RESET = "\033[0m"
 
 BANNER = f"""
-{R}╔══════════════════════════════════════════╗
-║  {W}Shadow Core Boot Puller  v3{R}           ║
-║  {B}OPPO Reno 5 CPH2159 | No Root Needed{R} ║
-╚══════════════════════════════════════════╝{RESET}
+{R}╔══════════════════════════════════════════════╗
+║  {W}Shadow Core Boot Puller  v4{R}               ║
+║  {B}OPPO Reno 5 CPH2159 | No Root | No PC{R}    ║
+║  {B}Method: OPPO OTA Server → boot.img{R}       ║
+╚══════════════════════════════════════════════╝{RESET}
 """
 
 OUTPUT_DIR = os.path.expanduser("~/boot_images")
+TEMP_DIR   = os.path.expanduser("~/boot_images/.tmp")
+
+# ─── CPH2159 Device Info ──────────────────
+DEVICE_INFO = {
+    "product_name": "CPH2159EX",        # ro.product.name
+    "ota_version":  "CPH2159EX_11_A.21_210127",  # ro.build.version.ota (مثال)
+    "rui_version":  1,                   # ColorOS = 1
+    "nv_id":        "0",
+    "region":       0,                   # GL=0, CN=1, IN=2, EU=3
+}
 
 def success(msg): print(f"{G}[✓] {msg}{RESET}")
 def error(msg):   print(f"{R}[✗] {msg}{RESET}")
 def warn(msg):    print(f"{Y}[!] {msg}{RESET}")
 def info(msg):    print(f"{C}[*] {msg}{RESET}")
-def step(msg):    print(f"\n{W}━━ {msg} ━━{RESET}")
+def step(n, msg): print(f"\n{W}━━[{n}] {msg}━━{RESET}")
 
-# ─── OFP Decrypt (Qualcomm / CPH2159) ────
-# Based on bkerler/oppo_decrypt (ofp_qc_decrypt.py)
-OFP_MAGIC = b"OPPOENCRYPT!"
+# ─── Read device props ────────────────────
+def get_prop(key):
+    try:
+        r = subprocess.run(
+            ["getprop", key],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5
+        )
+        val = r.stdout.strip()
+        return val if val else None
+    except:
+        return None
 
-def is_ofp_encrypted(filepath):
-    """تحقق إذا كان الملف OFP مشفر"""
-    with open(filepath, 'rb') as f:
-        magic = f.read(12)
-    return magic == OFP_MAGIC
+def read_device_info():
+    info("قراءة معلومات الجهاز...")
+    props = {
+        "product_name": get_prop("ro.product.name"),
+        "ota_version":  get_prop("ro.build.version.ota"),
+        "rui_version":  get_prop("ro.build.version.realmeui") or get_prop("ro.build.version.oplusrom"),
+        "nv_id":        get_prop("ro.build.oplus_nv_id") or "0",
+    }
 
-def ofp_qc_decrypt(ofp_path, out_dir):
-    """فك تشفير OFP لـ Qualcomm (CPH2159)"""
-    info(f"فك تشفير OFP: {os.path.basename(ofp_path)}")
-    os.makedirs(out_dir, exist_ok=True)
+    for k, v in props.items():
+        if v:
+            success(f"{k}: {v}")
+        else:
+            warn(f"{k}: غير متاح — سيُستخدم الافتراضي")
 
-    with open(ofp_path, 'rb') as f:
-        magic = f.read(12)
-        if magic != OFP_MAGIC:
-            warn("الملف غير مشفر أو صيغة مختلفة — سنحاول كـ ZIP مباشرة")
-            return False
+    # استخدم الافتراضي لـ CPH2159 إذا ما قرأنا البيانات
+    final = {}
+    final["product_name"] = props["product_name"] or DEVICE_INFO["product_name"]
+    final["ota_version"]  = props["ota_version"]  or DEVICE_INFO["ota_version"]
+    final["rui_version"]  = int(props["rui_version"] or DEVICE_INFO["rui_version"])
+    final["nv_id"]        = props["nv_id"] or DEVICE_INFO["nv_id"]
+    final["region"]       = DEVICE_INFO["region"]
 
-        # قراءة header
-        f.seek(0)
-        data = f.read()
+    return final
 
-    # OFP = ZIP مشفر بـ XOR مع key ثابت لـ Qualcomm
-    # Key الـ Qualcomm OPPO
-    key = bytearray([
-        0x6F, 0x70, 0x70, 0x6F, 0x71, 0x63, 0x6F, 0x6D,
-        0x6D, 0x75, 0x6E, 0x69, 0x63, 0x61, 0x74, 0x69
-    ])
+# ─── Install realme-ota ───────────────────
+def install_realme_ota():
+    info("التحقق من realme-ota...")
+    try:
+        r = subprocess.run(
+            [sys.executable, "-m", "realme_ota", "--help"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10
+        )
+        if r.returncode == 0 or "usage" in r.stdout.lower() or "usage" in r.stderr.lower():
+            success("realme-ota مثبت مسبقاً")
+            return True
+    except:
+        pass
 
-    decrypted = bytearray(len(data))
-    for i in range(len(data)):
-        decrypted[i] = data[i] ^ key[i % len(key)]
-
-    # احفظ كـ zip مؤقت
-    tmp_zip = os.path.join(out_dir, "_decrypted.zip")
-    with open(tmp_zip, 'wb') as f:
-        f.write(decrypted)
-
-    # تحقق من magic ZIP
-    with open(tmp_zip, 'rb') as f:
-        zip_magic = f.read(4)
-
-    if zip_magic != b'PK\x03\x04':
-        warn("فك التشفير لم يعمل بالـ XOR القياسي — الملف قد يكون MTK أو بصيغة مختلفة")
-        os.remove(tmp_zip)
+    info("تثبيت realme-ota من GitHub...")
+    try:
+        r = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet",
+             "git+https://github.com/R0rt1z2/realme-ota"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120
+        )
+        if r.returncode == 0:
+            success("تم تثبيت realme-ota!")
+            return True
+        else:
+            # جرب pip install requests أولاً
+            warn("فشل التثبيت من git — جاري تجربة طريقة بديلة...")
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--quiet", "requests", "pycryptodome"],
+                timeout=60
+            )
+            return install_realme_ota_manual()
+    except Exception as e:
+        error(f"فشل التثبيت: {e}")
         return False
 
-    success("تم فك التشفير بنجاح!")
-    return tmp_zip
+def install_realme_ota_manual():
+    """تحميل realme-ota مباشرة بدون git"""
+    try:
+        url = "https://raw.githubusercontent.com/R0rt1z2/realme-ota/master/realme_ota/main.py"
+        os.makedirs(TEMP_DIR, exist_ok=True)
+        dst = os.path.join(TEMP_DIR, "realme_ota_main.py")
+        urllib.request.urlretrieve(url, dst)
+        success("تم تحميل realme-ota يدوياً")
+        return True
+    except Exception as e:
+        error(f"فشل التحميل: {e}")
+        return False
 
-def extract_from_zip(zip_path, out_dir):
-    """استخراج boot.img من ZIP/OFP"""
+# ─── Query OPPO OTA server ────────────────
+def query_ota_server(device):
+    info("الاتصال بسيرفر OPPO للبحث عن OTA...")
+
+    cmd = [
+        sys.executable, "-m", "realme_ota",
+        "-s",  # silent
+        "-d", os.path.join(TEMP_DIR, "ota_response.json"),
+        device["product_name"],
+        device["ota_version"],
+        str(device["rui_version"]),
+        device["nv_id"],
+        "-r", str(device["region"])
+    ]
+
+    try:
+        os.makedirs(TEMP_DIR, exist_ok=True)
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           text=True, timeout=60)
+        output = r.stdout + r.stderr
+
+        # ابحث عن URL في الـ output
+        download_url = extract_url_from_output(output)
+        if download_url:
+            return {"url": download_url, "source": "realme-ota"}
+
+        # جرب قراءة الـ dump file
+        dump_file = os.path.join(TEMP_DIR, "ota_response.json")
+        if os.path.exists(dump_file):
+            with open(dump_file) as f:
+                data = json.load(f)
+            url = extract_url_from_json(data)
+            if url:
+                return {"url": url, "source": "realme-ota", "data": data}
+
+        warn(f"output: {output[:300]}")
+        return None
+
+    except subprocess.TimeoutExpired:
+        error("انتهى الوقت — السيرفر لا يستجيب")
+        return None
+    except Exception as e:
+        error(f"خطأ: {e}")
+        return None
+
+def extract_url_from_output(text):
+    import re
+    patterns = [
+        r'https?://[^\s\'"]+\.(?:zip|ozip|ofp)',
+        r'https?://[^\s\'"]+download[^\s\'"]+',
+        r'componentUrl[\'"]?\s*[=:]\s*[\'"]?(https?://[^\s\'"]+)',
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            return m.group(0).strip("'\",")
+    return None
+
+def extract_url_from_json(data):
+    """استخرج URL من JSON response"""
+    if isinstance(data, dict):
+        for key in ["url", "dlUrl", "componentUrl", "download_url", "fileUrl"]:
+            if key in data and data[key]:
+                return data[key]
+        # بحث عميق
+        for v in data.values():
+            result = extract_url_from_json(v)
+            if result:
+                return result
+    elif isinstance(data, list):
+        for item in data:
+            result = extract_url_from_json(item)
+            if result:
+                return result
+    elif isinstance(data, str) and data.startswith("http"):
+        return data
+    return None
+
+# ─── Alternative: danielspringer backend ─
+def query_danielspringer(device):
+    info("جاري الاستعلام من danielspringer.at...")
+    try:
+        url = f"https://roms.danielspringer.at/index.php?view=ota&device={device['product_name']}&region=global&version_index=0"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+        dl_url = extract_url_from_json(data)
+        if dl_url:
+            return {"url": dl_url, "source": "danielspringer"}
+    except Exception as e:
+        warn(f"danielspringer: {e}")
+    return None
+
+# ─── Download file ────────────────────────
+def download_file(url, dest_path):
+    info(f"جاري التحميل...")
+    info(f"URL: {url[:80]}...")
+
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36"
+        })
+
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            total = int(resp.headers.get("Content-Length", 0))
+            total_mb = total / (1024*1024)
+            info(f"حجم الملف: {total_mb:.0f} MB")
+
+            if total_mb > 3000:
+                warn(f"الملف كبير جداً ({total_mb:.0f} MB) — قد يستغرق وقتاً طويلاً")
+
+            downloaded = 0
+            chunk = 1024 * 1024  # 1MB chunks
+            with open(dest_path, 'wb') as f:
+                while True:
+                    buf = resp.read(chunk)
+                    if not buf:
+                        break
+                    f.write(buf)
+                    downloaded += len(buf)
+                    if total > 0:
+                        pct = downloaded / total * 100
+                        done_mb = downloaded / (1024*1024)
+                        print(f"\r{C}  [{pct:5.1f}%] {done_mb:.0f}/{total_mb:.0f} MB{RESET}", end="", flush=True)
+
+        print()
+        size = os.path.getsize(dest_path)
+        if size > 0:
+            success(f"تم التحميل: {size/(1024*1024):.1f} MB")
+            return True
+        else:
+            error("الملف فارغ!")
+            return False
+
+    except Exception as e:
+        print()
+        error(f"فشل التحميل: {e}")
+        return False
+
+# ─── OTA Decrypt (.ozip) ─────────────────
+def decrypt_ozip(ozip_path, out_dir):
+    """فك تشفير .ozip باستخدام bkerler/oppo_ozip_decrypt"""
+    info("فك تشفير .ozip...")
+
+    # حاول تثبيت pycryptodome
+    subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "pycryptodome"], timeout=60)
+
+    # حمّل سكريبت الفك مباشرة
+    script_url = "https://raw.githubusercontent.com/bkerler/oppo_ozip_decrypt/master/ozipdecrypt.py"
+    script_path = os.path.join(TEMP_DIR, "ozipdecrypt.py")
+
+    try:
+        urllib.request.urlretrieve(script_url, script_path)
+    except Exception as e:
+        error(f"فشل تحميل أداة الفك: {e}")
+        return None
+
+    r = subprocess.run(
+        [sys.executable, script_path, ozip_path],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, cwd=out_dir, timeout=300
+    )
+
+    # ابحث عن الملف المفكوك
+    for f in os.listdir(out_dir):
+        if f.endswith(".zip") and "ozip" not in f.lower():
+            return os.path.join(out_dir, f)
+
+    # أحياناً يُنشئ نفس الاسم بـ .zip
+    zip_path = ozip_path.replace(".ozip", ".zip")
+    if os.path.exists(zip_path):
+        return zip_path
+
+    warn(f"stdout: {r.stdout[:200]}")
+    warn(f"stderr: {r.stderr[:200]}")
+    return None
+
+# ─── Extract boot.img ─────────────────────
+def extract_boot_from_zip(zip_path, out_dir):
+    info(f"استخراج boot.img من: {os.path.basename(zip_path)}")
     os.makedirs(out_dir, exist_ok=True)
-    boot_targets = ['boot.img', 'boot_a.img', 'boot_b.img', 'BOOT.IMG']
 
-    info(f"فحص محتوى الملف...")
+    boot_names = ['boot.img', 'boot_a.img', 'boot_b.img', 'BOOT.IMG']
 
     try:
         with zipfile.ZipFile(zip_path, 'r') as zf:
             all_files = zf.namelist()
 
-            # اطبع ملفات IMG الموجودة
-            img_files = [f for f in all_files if f.lower().endswith('.img')]
-            if img_files:
-                info(f"ملفات IMG موجودة في الأرشيف:")
-                for img in img_files[:15]:
-                    print(f"   {B}{img}{RESET}")
-                if len(img_files) > 15:
-                    print(f"   {B}... و {len(img_files)-15} ملفات أخرى{RESET}")
-            else:
-                warn("لا توجد ملفات .img مباشرة — قد تكون داخل ZIP فرعي")
+            # اعرض ملفات IMG
+            imgs = [f for f in all_files if f.lower().endswith('.img')]
+            if imgs:
+                info(f"ملفات IMG في الأرشيف ({len(imgs)} ملف):")
+                for img in imgs[:10]:
+                    print(f"   {B}• {img}{RESET}")
 
             # ابحث عن boot.img
             found = None
-            for target in boot_targets:
+            for name in boot_names:
                 for f in all_files:
-                    if os.path.basename(f).lower() == target.lower():
+                    if os.path.basename(f).lower() == name.lower():
                         found = f
                         break
                 if found:
                     break
 
             if not found:
-                # بحث أعمق — zip داخل zip
-                warn("boot.img غير موجود مباشرة — أبحث داخل ZIPs الفرعية...")
+                # بحث في ZIPs الفرعية
+                warn("boot.img غير موجود مباشرة — فحص ZIPs الفرعية...")
                 for f in all_files:
-                    if f.lower().endswith('.zip') or f.lower().endswith('.ofp'):
-                        info(f"ZIP فرعي: {f}")
-                        sub_zip_data = zf.read(f)
-                        sub_path = os.path.join(out_dir, os.path.basename(f))
+                    if f.lower().endswith('.zip'):
+                        sub_data = zf.read(f)
+                        sub_path = os.path.join(TEMP_DIR, os.path.basename(f))
                         with open(sub_path, 'wb') as sf:
-                            sf.write(sub_zip_data)
-                        result = extract_from_zip(sub_path, out_dir)
-                        os.remove(sub_path)
+                            sf.write(sub_data)
+                        result = extract_boot_from_zip(sub_path, out_dir)
                         if result:
                             return result
                 return None
 
-            # استخرج boot.img
-            info(f"جاري استخراج: {found}")
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_file = os.path.join(out_dir, f"boot_CPH2159_{timestamp}.img")
+            # استخراج
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_file = os.path.join(out_dir, f"boot_CPH2159_{ts}.img")
 
+            info(f"استخراج: {found} → {os.path.basename(out_file)}")
             with zf.open(found) as src, open(out_file, 'wb') as dst:
                 shutil.copyfileobj(src, dst)
 
             return out_file
 
     except zipfile.BadZipFile:
-        error("الملف ليس ZIP صحيح")
+        error("ملف ZIP تالف")
         return None
     except Exception as e:
-        error(f"خطأ أثناء الاستخراج: {e}")
+        error(f"خطأ: {e}")
         return None
 
-def verify_boot_image(filepath):
-    """تحقق من صحة boot.img"""
-    info("التحقق من صحة الملف...")
+# ─── Verify boot.img ──────────────────────
+def verify_boot(filepath):
+    info("التحقق من صحة boot.img...")
     try:
         with open(filepath, 'rb') as f:
             magic = f.read(8)
         if magic[:8] == b'ANDROID!':
-            success("ملف boot.img صحيح ✅ (Magic: ANDROID!)")
-            return True
+            success("boot.img صحيح ✅ (ANDROID! magic)")
         elif magic[:3] == b'\x1f\x8b\x08':
-            warn("الملف مضغوط gzip — قد يكون kernel مباشرة")
-            return True
+            warn("ملف gzip — قد يكون kernel مباشرة")
         else:
-            warn(f"Magic: {magic.hex()} — قد يكون صحيحاً بصيغة مختلفة")
-            return True
+            warn(f"Magic: {magic.hex()} — قد يكون صحيحاً")
     except Exception as e:
         warn(f"تعذر التحقق: {e}")
-        return False
-
-def check_dependencies():
-    """تحقق من وجود Python packages"""
-    info("فحص المتطلبات...")
-    try:
-        import zipfile
-        success("zipfile ✓")
-    except:
-        error("zipfile غير موجود")
-        return False
-    return True
-
-def find_rom_file():
-    """ابحث عن ملف ROM في مجلدات شائعة"""
-    search_dirs = [
-        os.path.expanduser("~/storage/downloads"),
-        os.path.expanduser("~/storage/shared/Download"),
-        "/sdcard/Download",
-        "/sdcard/Downloads",
-        os.path.expanduser("~"),
-    ]
-
-    found_files = []
-    extensions = ['.ofp', '.zip', '.OFP', '.ZIP']
-
-    for d in search_dirs:
-        if os.path.exists(d):
-            try:
-                for f in os.listdir(d):
-                    if any(f.endswith(ext) for ext in extensions):
-                        full = os.path.join(d, f)
-                        size_mb = os.path.getsize(full) / (1024*1024)
-                        # فقط ملفات أكبر من 50MB (ROM حقيقي)
-                        if size_mb > 50:
-                            found_files.append((full, size_mb))
-            except:
-                pass
-
-    return found_files
 
 def show_next_steps(output_file):
-    print(f"\n{C}{'═'*44}")
-    print(f"  الخطوات التالية — تثبيت Magisk Root")
-    print(f"{'═'*44}{RESET}")
-    print(f"{W}1. ثبّت تطبيق Magisk من:{RESET}")
-    print(f"   {B}https://github.com/topjohnwu/Magisk/releases{RESET}")
-    print(f"{W}2. افتح Magisk → Install → Select and Patch a File{RESET}")
-    print(f"{W}3. اختر الملف:{RESET}")
-    print(f"   {B}{output_file}{RESET}")
-    print(f"{W}4. سيُنشئ Magisk ملف:{RESET}")
-    print(f"   {B}magisk_patched_xxxx.img{RESET}")
-    print(f"{W}5. فلّش الملف عبر fastboot:{RESET}")
+    print(f"\n{C}{'═'*46}")
+    print(f"  الخطوات التالية — Root بـ Magisk")
+    print(f"{'═'*46}{RESET}")
+    print(f"{W}1. ثبّت Magisk APK:{RESET}")
+    print(f"   {B}github.com/topjohnwu/Magisk/releases{RESET}")
+    print(f"{W}2. Magisk → Install → Patch a File{RESET}")
+    print(f"{W}3. اختر: {B}{output_file}{RESET}")
+    print(f"{W}4. فلّش الملف الناتج:{RESET}")
     print(f"   {B}fastboot flash boot magisk_patched.img{RESET}")
-    print(f"{C}{'═'*44}{RESET}\n")
+    print(f"{C}{'═'*46}{RESET}\n")
 
+# ─── Main ─────────────────────────────────
 def main():
     print(BANNER)
-    print(f"{B}الجهاز: OPPO Reno 5 CPH2159 | ColorOS | Helio P95{RESET}")
-    print(f"{B}الوضع: استخراج boot.img من ROM بدون Root{RESET}\n")
-
-    if not check_dependencies():
-        sys.exit(1)
-
-    step("البحث عن ملف ROM")
-
-    rom_file = None
-    found_files = find_rom_file()
-
-    if found_files:
-        info(f"تم العثور على {len(found_files)} ملف ROM محتمل:")
-        for i, (path, size) in enumerate(found_files):
-            print(f"  {Y}[{i+1}]{RESET} {os.path.basename(path)} {B}({size:.0f} MB){RESET}")
-
-        print(f"\n{W}اختر رقم الملف، أو اضغط 0 لإدخال مسار يدوي: {RESET}", end="")
-        try:
-            choice = input().strip()
-            if choice == '0' or not choice:
-                rom_file = None
-            else:
-                idx = int(choice) - 1
-                if 0 <= idx < len(found_files):
-                    rom_file, _ = found_files[idx]
-        except (ValueError, KeyboardInterrupt):
-            pass
-
-    if not rom_file:
-        print(f"\n{W}أدخل المسار الكامل لملف OFP أو ZIP:{RESET}")
-        print(f"{B}مثال: /sdcard/Download/CPH2159_firmware.ofp{RESET}")
-        print(f"{W}المسار: {RESET}", end="")
-        try:
-            rom_file = input().strip().strip("'\"")
-        except KeyboardInterrupt:
-            print()
-            warn("تم الإلغاء.")
-            sys.exit(0)
-
-    if not rom_file or not os.path.exists(rom_file):
-        error(f"الملف غير موجود: {rom_file}")
-        print(f"\n{Y}كيف تحصل على ملف ROM للـ CPH2159:{RESET}")
-        print(f"  1. ابحث عن: {W}CPH2159 OFP firmware download{RESET}")
-        print(f"  2. مواقع موثوقة: {B}oppoflash.com, androidfilehost.com{RESET}")
-        print(f"  3. حجم الملف عادة: {B}500MB - 3GB{RESET}")
-        sys.exit(1)
-
-    file_size = os.path.getsize(rom_file) / (1024*1024)
-    success(f"الملف: {os.path.basename(rom_file)} ({file_size:.0f} MB)")
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(TEMP_DIR, exist_ok=True)
 
-    step("تحليل الملف")
+    # ─ 1. قراءة معلومات الجهاز ─
+    step(1, "قراءة معلومات الجهاز")
+    device = read_device_info()
 
-    ext = os.path.splitext(rom_file)[1].lower()
-    extracted_boot = None
+    print(f"\n{Y}معلومات الجهاز المستخدمة:{RESET}")
+    for k, v in device.items():
+        print(f"  {B}{k}:{RESET} {W}{v}{RESET}")
 
-    if ext == '.ofp':
-        info("صيغة OFP مكتشفة — جاري فك التشفير...")
-        if is_ofp_encrypted(rom_file):
-            decrypted = ofp_qc_decrypt(rom_file, OUTPUT_DIR)
-            if decrypted:
-                step("استخراج boot.img من OFP")
-                extracted_boot = extract_from_zip(decrypted, OUTPUT_DIR)
-                os.remove(decrypted)
-            else:
-                # جرب مباشرة كـ ZIP
-                warn("جاري المحاولة كـ ZIP مباشرة...")
-                extracted_boot = extract_from_zip(rom_file, OUTPUT_DIR)
-        else:
-            info("OFP غير مشفر — استخراج مباشر...")
-            extracted_boot = extract_from_zip(rom_file, OUTPUT_DIR)
+    print(f"\n{W}هل المعلومات صحيحة؟ (y/n) أو اضغط Enter للتأكيد: {RESET}", end="")
+    try:
+        confirm = input().strip().lower()
+        if confirm == 'n':
+            print(f"{W}أدخل OTA version يدوياً (مثال: CPH2159EX_11_A.21_210127): {RESET}", end="")
+            device["ota_version"] = input().strip() or device["ota_version"]
+    except KeyboardInterrupt:
+        print()
+        sys.exit(0)
 
-    elif ext == '.zip':
-        step("استخراج boot.img من ZIP")
-        extracted_boot = extract_from_zip(rom_file, OUTPUT_DIR)
+    # ─ 2. تثبيت realme-ota ─
+    step(2, "تجهيز أداة الاستعلام")
+    ota_tool_ok = install_realme_ota()
 
-    else:
-        error(f"صيغة غير مدعومة: {ext}")
-        error("الصيغ المدعومة: .ofp .zip")
+    # ─ 3. استعلام OTA ─
+    step(3, "الاستعلام عن OTA من OPPO")
+    ota_result = None
+
+    if ota_tool_ok:
+        ota_result = query_ota_server(device)
+
+    if not ota_result:
+        warn("realme-ota لم تُرجع نتيجة — جاري تجربة danielspringer...")
+        ota_result = query_danielspringer(device)
+
+    if not ota_result:
+        error("لم يتم العثور على OTA لهذا الجهاز")
+        print(f"\n{Y}الأسباب المحتملة:{RESET}")
+        print(f"  • الجهاز على أحدث إصدار (لا يوجد OTA جديد)")
+        print(f"  • السيرفر يحتاج IMEI للتحقق")
+        print(f"  • جرب تحديث ota_version في الكود")
+        print(f"\n{W}هل تريد إدخال رابط OTA يدوياً؟ (y/n): {RESET}", end="")
+        try:
+            if input().strip().lower() == 'y':
+                print(f"{W}الرابط: {RESET}", end="")
+                manual_url = input().strip()
+                if manual_url:
+                    ota_result = {"url": manual_url, "source": "manual"}
+        except:
+            pass
+
+        if not ota_result:
+            sys.exit(1)
+
+    download_url = ota_result["url"]
+    success(f"OTA URL: {download_url[:80]}...")
+
+    # ─ 4. تحميل الملف ─
+    step(4, "تحميل OTA package")
+
+    ext = ".ozip" if ".ozip" in download_url else ".zip"
+    ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dl_path = os.path.join(TEMP_DIR, f"CPH2159_OTA_{ts}{ext}")
+
+    if not download_file(download_url, dl_path):
         sys.exit(1)
+
+    # ─ 5. فك التشفير (إذا .ozip) ─
+    step(5, "معالجة الملف")
+
+    zip_path = dl_path
+    if dl_path.endswith(".ozip"):
+        decrypted = decrypt_ozip(dl_path, TEMP_DIR)
+        if decrypted:
+            zip_path = decrypted
+            success(f"تم فك التشفير: {os.path.basename(zip_path)}")
+        else:
+            warn("فشل فك التشفير — سنحاول مباشرة كـ ZIP")
+
+    # ─ 6. استخراج boot.img ─
+    step(6, "استخراج boot.img")
+    boot_file = extract_boot_from_zip(zip_path, OUTPUT_DIR)
+
+    # نظّف الملفات المؤقتة
+    try:
+        shutil.rmtree(TEMP_DIR)
+    except:
+        pass
 
     print()
 
-    if extracted_boot and os.path.exists(extracted_boot):
-        size = os.path.getsize(extracted_boot) / (1024*1024)
+    if boot_file and os.path.exists(boot_file):
+        size = os.path.getsize(boot_file) / (1024*1024)
         success(f"تم استخراج boot.img!")
-        success(f"الملف: {extracted_boot}")
+        success(f"الملف: {boot_file}")
         success(f"الحجم: {size:.2f} MB")
-        verify_boot_image(extracted_boot)
-        show_next_steps(extracted_boot)
+        verify_boot(boot_file)
+        show_next_steps(boot_file)
         success("🖤 Shadow Core — مهمة مكتملة")
     else:
-        error("لم يتم العثور على boot.img في الملف المحدد")
-        print(f"\n{Y}تأكد من:{RESET}")
-        print(f"  - أن الملف هو ROM خاص بـ CPH2159")
-        print(f"  - أن الملف لم يتلف أثناء التحميل")
-        print(f"  - جرب ملف ROM من مصدر آخر")
+        error("لم يتم العثور على boot.img في الـ OTA package")
         sys.exit(1)
 
 if __name__ == "__main__":
